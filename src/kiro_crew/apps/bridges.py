@@ -25,12 +25,18 @@ from typing import Any, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
 
 from kiro_crew import platform_compat
+from kiro_crew.apps import deps_boot as _deps_boot_module
 from kiro_crew.apps.cron_sdk import CronSDK
 from kiro_crew.apps.execution import (
     app_execution_denied,
     shipped_builtin_app_root,
 )
-from kiro_crew.apps.interpreter import resolve_app_python, venv_provided_command
+from kiro_crew.apps.interpreter import (
+    _venv_is_usable,
+    app_deps_dir,
+    resolve_app_python,
+    venv_provided_command,
+)
 from kiro_crew.apps.manager import (
     app_data_dir,
     app_dir,
@@ -52,6 +58,11 @@ from kiro_crew.env import emit_env
 from kiro_crew.executors import maintenance_executor
 from kiro_crew.platform.governance import may_skip_gate_now, strip_ungoverned_auto_approve
 from kiro_crew.sel import sel
+
+#: Absolute path of the stdlib-only launch shim, for interpreters whose
+#: flags (-S/-E/-I) make the ``-m kiro_crew.apps.deps_boot`` spelling
+#: unimportable.
+_DEPS_BOOT_PATH = Path(os.path.abspath(_deps_boot_module.__file__))
 
 logger = logging.getLogger(__name__)
 
@@ -665,11 +676,7 @@ def _unresolvable_tool_refs(agent_data: dict[str, Any]) -> list[str]:
         # exists for exactly the specs (mochi's) that set this flag.
         return [f"{entry} (server {server!r})" for entry, server in candidates]
     ambient = set(_global_mcp_specs())
-    return [
-        f"{entry} (server {server!r})"
-        for entry, server in candidates
-        if server not in ambient
-    ]
+    return [f"{entry} (server {server!r})" for entry, server in candidates if server not in ambient]
 
 
 #: Keys the framework OWNS in a materialized app agent config: each is derived
@@ -1249,10 +1256,7 @@ def _deregister_skills(app_name: str) -> int:
                 # is_link_or_junction: a junction (non-admin Windows) is not a
                 # symlink, and unlink_link_or_junction removes the link, never
                 # the target it points at.
-                if (
-                    platform_compat.is_link_or_junction(flat_link)
-                    and flat_link.resolve() == target
-                ):
+                if platform_compat.is_link_or_junction(flat_link) and flat_link.resolve() == target:
                     platform_compat.unlink_link_or_junction(flat_link)
                 platform_compat.unlink_link_or_junction(item)
         # Only prune the directory if registration is all that was ever in it.
@@ -1962,9 +1966,10 @@ def _live_port_for(app_name: str, live_port: int | None) -> int | None:
 
 
 #: Bare python launchers an app manifest may name. Each is substituted with a resolved
-#: absolute interpreter — the app's own venv python when it exists (the interpreter its
-#: dependencies were installed against), else the RUNNING interpreter, which is the only
-#: one guaranteed to import ``kiro_crew``.
+#: absolute interpreter — the RUNNING interpreter when the gateway provisioned the app's
+#: deps dir (its wheels are ABI-bound to that interpreter), else the app's own venv
+#: python when a version-matched one exists, else the RUNNING interpreter, which is the
+#: only one guaranteed to import ``kiro_crew``.
 _BARE_PYTHON = frozenset({"python", "python3", "py"})
 
 
@@ -1981,24 +1986,74 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
     entry for exactly that reason; this is the same decision for app manifests.
 
     With ``app_root``, the resolution matches what the app's BACKEND launcher already does
-    (see :mod:`kiro_crew.apps.interpreter`): prefer the app's own venv interpreter — that is
-    where its ``requirements.txt`` was installed, so anything else risks starting the server
-    under an interpreter missing the app's dependencies — else fall back to the gateway's
-    ``sys.executable``. The two spawn paths share one policy on purpose; a second divergent
-    copy is the defect this shape removes.
+    (see :mod:`kiro_crew.apps.interpreter`): the gateway's ``sys.executable`` whenever the
+    gateway has provisioned the app's deps dir (``pip install --target`` — those wheels are
+    ABI-bound to that interpreter), else the app's own venv interpreter when a
+    version-matched one exists, else ``sys.executable`` — and expose the provisioned deps
+    dir through ``PYTHONPATH`` exactly as the backend spawn env does, EXCEPT to a server
+    launching a ``kiro_crew`` module, which must never see an app-supplied ``kiro_crew``
+    copy. The two spawn paths share one policy on purpose; a second divergent copy is the
+    defect this shape removes.
 
     The rewrite rule, precisely: only a BARE name (no path separator) is ever touched, and
-    then only when it is a known python launcher OR the app's venv provides that exact
-    binary (a venv console script — invisible to PATH because the venv is never activated).
-    An absolute path, a command carrying a path, or a bare PATH dependency the venv does not
-    provide (``node``, ``npx``, ``docker``) was chosen deliberately and is left untouched, as
-    is an HTTP entry (no ``command``). Getting this predicate wrong breaks working apps, so
-    the boundary is pinned by tests on both sides.
+    then only when it is a known python launcher OR the app's venv or deps dir provides that
+    exact binary (a pip console script — invisible to PATH because neither layout is ever
+    activated). An absolute path, a command carrying a path, or a bare PATH dependency the
+    app does not provide (``node``, ``npx``, ``docker``) was chosen deliberately and is left
+    untouched, as is an HTTP entry (no ``command``). Getting this predicate wrong breaks
+    working apps, so the boundary is pinned by tests on both sides.
     """
     command = cfg.get("command")
     if not isinstance(command, str):
         return cfg
     name = command.strip()
+    if app_root is not None and not _targets_gateway_module(cfg):
+        # Expose the provisioned deps dir the same way the backend spawn env
+        # does: a --target install carries no interpreter, so PYTHONPATH is the
+        # only bridge — a deps-provided console script's shebang is
+        # sys.executable and imports its own package from here, and a
+        # python-launcher server imports the app's requirements from here.
+        # Prepended so the app's pinned requirements win over a manifest's own
+        # PYTHONPATH. Inert for non-Python commands, and skipped entirely when
+        # the app has no provisioned deps dir. Runs BEFORE the path-command
+        # early return below: a path-based command (./bin/server,
+        # .venv/bin/python) is never rewritten, but it still needs the app's
+        # provisioned deps on import. NEVER injected into a server that
+        # launches a kiro_crew module: an app that pip-pins its own kiro_crew
+        # copy would otherwise shadow the gateway's code with a foreign
+        # version on the gateway's own interpreter — the same reason
+        # _targets_gateway_module pins sys.executable below. Registration can
+        # precede the first backend spawn (which provisions the dir), so the
+        # path is emitted whenever provisioning is EXPECTED (the app ships a
+        # requirements.txt) even before the dir exists: a missing PYTHONPATH
+        # entry is inert to Python. And ONLY while the requirements.txt is
+        # still declared: an update that removes it must not leave a stale
+        # preserved tree injecting removed dependency code.
+        # ABI gate for PATH-carrying commands: the deps tree is built by the
+        # GATEWAY's pip, so its wheels are ABI-bound to the gateway's
+        # interpreter. Bare names are safe (their resolution below is the
+        # gateway interpreter, a version-probed venv python, or a
+        # deps/venv-provided script whose shebang is one of those two), but
+        # a path-pinned command is arbitrary — a manifest naming a foreign
+        # python (3.11 against 3.12-built wheels) would import mismatched
+        # binary wheels and die. A path command gets the deps PYTHONPATH
+        # only on a POSITIVE match: it resolves to the gateway interpreter
+        # itself, or to the app venv's python when that venv passed the
+        # version probe. Everything else keeps its env untouched — exactly
+        # the pre-deps status quo for that server.
+        deps_dir = app_deps_dir(app_root)
+        _carries_path = bool(
+            os.sep in name
+            or (os.altsep is not None and os.altsep in name)
+            or os.path.splitdrive(name)[0]
+        )
+        if (app_root / "requirements.txt").is_file() and (
+            not _carries_path or _path_command_is_abi_matched(app_root, name)
+        ):
+            env = dict(cfg.get("env") or {})
+            existing = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{deps_dir}{os.pathsep}{existing}" if existing else str(deps_dir)
+            cfg["env"] = env
     if (
         not name
         or os.sep in name
@@ -2027,19 +2082,168 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
             cfg["command"] = sys.executable
         else:
             cfg["command"] = resolve_app_python(app_root)
+            # Provisioned-deps launch shim (same reasoning as the backend
+            # spawn): PYTHONPATH never processes .pth files, so a python
+            # launcher with provisioned (or expected) deps routes through
+            # deps_boot, which site.addsitedir()s the deps dir first. Only
+            # when the resolved interpreter is the GATEWAY's own (deps pin
+            # sys.executable; the shim is gateway code and must not be
+            # imported by a foreign interpreter). Interpreter options are
+            # WALKED, not guessed: the shim triple is inserted at the target
+            # token (script or -m), so `-u server.py` keeps -u consumed by
+            # the interpreter and server.py shimmed; an unshimmable shape
+            # (-c, --, attached -mMODULE) falls back to the PYTHONPATH
+            # transport.
+            _args = _normalize_attached_m(list(cfg.get("args") or []))
+            if (
+                app_root is not None
+                and cfg["command"] == sys.executable
+                and (app_root / "requirements.txt").is_file()
+            ):
+                _ti = _py_target_index(_args)
+                if _ti is not None:
+                    # -S/-E/-I forbid the -m spelling (site-packages or
+                    # PYTHONPATH never reach sys.path, so kiro_crew is not
+                    # importable); the stdlib-only shim is launched by
+                    # absolute path instead — same argv contract.
+                    if _prefix_isolates_imports(_args[:_ti]):
+                        _shim = [str(_DEPS_BOOT_PATH)]
+                    else:
+                        _shim = ["-m", "kiro_crew.apps.deps_boot"]
+                    cfg["args"] = [
+                        *_args[:_ti],
+                        *_shim,
+                        str(app_deps_dir(app_root)),
+                        *_args[_ti:],
+                    ]
+                    _strip_deps_pythonpath(cfg, app_deps_dir(app_root))
             # The one remaining silent-death path: a script-entry server that
             # imports gateway-env packages flips to the venv interpreter the
             # moment a venv materialises and dies on import with no warning
             # (the rewritten path exists). Make the chosen interpreter
             # greppable so that diagnosis starts from a log line.
-            logger.debug(
-                "stdio MCP command %r resolved to interpreter %s", name, cfg["command"]
-            )
+            logger.debug("stdio MCP command %r resolved to interpreter %s", name, cfg["command"])
     elif app_root is not None:
         venv_cmd = venv_provided_command(app_root, name)
         if venv_cmd is not None:
             cfg["command"] = venv_cmd
+            deps_dir = app_deps_dir(app_root)
+            if (
+                deps_dir in Path(venv_cmd).parents
+                and (app_root / "requirements.txt").is_file()
+                and _has_python_shebang(venv_cmd)
+            ):
+                # A deps-dir console script is a pip-generated Python script
+                # whose shebang is the interpreter that ran pip — the
+                # gateway's own. Run direct, its editable/.pth-dependent
+                # imports die (PYTHONPATH never processes .pth), so route it
+                # through deps_boot like every other python launch: same
+                # interpreter the shebang names, but addsitedir first. Only
+                # scripts that ARE python (shebang sniff) — a package can
+                # ship arbitrary bin artifacts, and runpy on a shell script
+                # would break a launch that used to work. Shim XOR
+                # PYTHONPATH, as everywhere.
+                cfg["command"] = sys.executable
+                cfg["args"] = [
+                    "-m",
+                    "kiro_crew.apps.deps_boot",
+                    str(deps_dir),
+                    venv_cmd,
+                    *(cfg.get("args") or []),
+                ]
+                _strip_deps_pythonpath(cfg, deps_dir)
     return cfg
+
+
+def _path_command_is_abi_matched(app_root: Path, name: str) -> bool:
+    """True when a path-carrying command positively matches the deps ABI.
+
+    Positive means: the path resolves to the gateway's own interpreter, or
+    to the app venv's python while that venv passes the interpreter version
+    probe (:func:`_venv_is_usable`). Any resolution failure reads as "no
+    match" — the server simply does not receive the deps PYTHONPATH.
+    """
+    try:
+        cand = Path(name)
+        if not cand.is_absolute():
+            cand = app_root / cand
+        resolved = cand.resolve(strict=True)
+    except OSError:
+        return False
+    try:
+        if resolved == Path(sys.executable).resolve():
+            return True
+    except OSError:
+        return False
+    venv_bin = app_root / ".venv" / ("Scripts" if platform_compat.IS_WINDOWS else "bin")
+    if not venv_bin.is_dir():
+        return False
+    try:
+        if resolved.parent != venv_bin.resolve(strict=True):
+            return False
+    except OSError:
+        return False
+    if not resolved.name.lower().startswith("python"):
+        return False
+    return _venv_is_usable(app_root)
+
+
+def _strip_deps_pythonpath(cfg: dict, deps_dir: Path) -> None:
+    """Drop the deps dir from a shimmed server's PYTHONPATH, in place.
+
+    Shim XOR PYTHONPATH: ``-m kiro_crew.apps.deps_boot`` resolves kiro_crew
+    through sys.path, so a deps-provided kiro_crew copy on PYTHONPATH would
+    SHADOW the gateway's shim — app code running as the "shim" on the
+    gateway's own interpreter. addsitedir supplies the deps only after the
+    trusted shim has imported; a manifest's own PYTHONPATH entries pass
+    through untouched.
+    """
+    env = dict(cfg.get("env") or {})
+    parts = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p != str(deps_dir)]
+    if parts:
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+    else:
+        env.pop("PYTHONPATH", None)
+    if env:
+        cfg["env"] = env
+    else:
+        cfg.pop("env", None)
+
+
+def _has_python_shebang(script: str) -> bool:
+    """True when ``script`` opens with a ``#!`` line naming a python.
+
+    pip-generated console scripts do (their shebang is the interpreter that
+    ran pip); native binaries and foreign-language scripts do not. Any read
+    failure reads as "not python" — the launch falls back to direct
+    execution, which is what happened before the shim existed.
+    """
+    try:
+        with open(script, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return False
+    lines = head.split(b"\n")
+    first = lines[0]
+    if not first.startswith(b"#!"):
+        return False
+    if b"python" in first.lower():
+        return True
+    # pip (distlib) emits a shell TRAMPOLINE when the interpreter path is
+    # too long or contains spaces: a /bin/sh shebang whose SECOND line is
+    # exactly the polyglot re-exec — a triple-quote-fenced `exec <python>
+    # "$0" "$@"`. Match that structure, not token presence: a dependency's
+    # ordinary shell wrapper that merely MENTIONS python somewhere must not
+    # be handed to runpy as python source.
+    if b"sh" not in first or len(lines) < 2:
+        return False
+    second = lines[1]
+    q3 = b"\x27\x27\x27"  # three single quotes
+    return (
+        second.startswith(q3 + b"exec\x27 ")
+        and b'"$0" "$@"' in second
+        and b"python" in second.lower()
+    )
 
 
 #: CPython interpreter options that consume the NEXT argv element as their
@@ -2048,6 +2252,92 @@ def resolve_stdio_command(cfg: dict, app_root: Path | None = None) -> dict:
 #: -Xdev). Kept as an explicit table so the scanner's skip logic is checkable
 #: against `python --help` rather than inferred per finding.
 _PY_OPTS_WITH_SEPARATE_VALUE = frozenset({"-X", "-W", "--check-hash-based-pycs"})
+
+
+def _normalize_attached_m(args: list) -> list:
+    """Split attached ``-mMODULE`` / ``-cCODE`` spellings into separate form.
+
+    CPython treats ``-mserver`` and ``-m server`` identically (same for
+    ``-c``); the shim walker only takes over the separate forms, so the
+    attached spellings would silently fall back to the PYTHONPATH transport
+    and skip ``.pth`` processing. Walks the same option-prefix branch table;
+    returns the args unchanged when there is nothing to normalize.
+    """
+    out: list = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not isinstance(arg, str):
+            return args
+        if arg in ("-m", "-c") or arg == "--" or not arg.startswith("-"):
+            return [*out, *args[i:]]
+        if arg.startswith(("-m", "-c")) and len(arg) > 2:
+            return [*out, arg[:2], arg[2:], *args[i + 1 :]]
+        out.append(arg)
+        if arg in _PY_OPTS_WITH_SEPARATE_VALUE:
+            if i + 1 < len(args):
+                out.append(args[i + 1])
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _prefix_isolates_imports(prefix: list) -> bool:
+    """True when the interpreter-option prefix carries -S, -E or -I.
+
+    Those flags kill the ``-m`` shim spelling: -S skips site initialization
+    so site-packages (where kiro_crew lives) never reaches sys.path; -E
+    ignores PYTHONPATH (a source-checkout gateway imports through it); -I
+    implies both. The shim must then be launched BY ABSOLUTE PATH —
+    deps_boot is stdlib-only, so the path spelling needs no importable
+    kiro_crew (and `import site` works even under -S). Attached -W/-X
+    VALUES carry arbitrary text, not clustered flags, and are excluded.
+    """
+    for a in prefix:
+        if not isinstance(a, str):
+            continue
+        if a in ("-S", "-E", "-I"):
+            return True
+        if (
+            a.startswith("-")
+            and not a.startswith("--")
+            and len(a) > 1
+            and a[1] not in ("W", "X")
+            and a[1:].isalnum()
+            and any(ch in "SEI" for ch in a[1:])
+        ):
+            return True
+    return False
+
+
+def _py_target_index(args: list) -> int | None:
+    """Index of the first token CPython treats as the LAUNCH TARGET.
+
+    Walks the interpreter-option prefix with the same branch table as
+    :func:`_targets_gateway_module`, returning the index of the script
+    operand or a separate ``-m`` — the insertion point for the deps_boot
+    shim triple, so interpreter options stay consumed by the interpreter.
+    ``None`` for shapes the shim does not take over (``-c`` command strings,
+    ``--``, the attached ``-mMODULE`` spelling, non-string tokens, or an
+    option prefix with no target): those keep the PYTHONPATH transport.
+    """
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not isinstance(arg, str):
+            return None
+        if arg in ("-m", "-c"):
+            return i if i + 1 < len(args) else None
+        if arg == "--" or (arg.startswith(("-m", "-c")) and len(arg) > 2):
+            return None
+        if not arg.startswith("-"):
+            return i
+        if arg in _PY_OPTS_WITH_SEPARATE_VALUE:
+            i += 2
+            continue
+        i += 1
+    return None
 
 
 def _targets_gateway_module(cfg: dict) -> bool:
@@ -2165,6 +2455,66 @@ def _schedule_unresolvable_warning(app_name: str, server_name: str, cfg: dict) -
     )
 
 
+def _maybe_provision_backendless_deps(app_name: str, manifest: "AppManifest") -> None:
+    """Provision requirements.txt for an app that has NO backend entry point.
+
+    Provisioning normally runs in the backend spawn — but an app can ship
+    only stdio MCP servers, and with no backend start nothing else ever runs
+    pip: the shim/PYTHONPATH transports the resolution below emits would
+    reference a forever-empty deps tree and the server would die on its
+    first import. Stamp-gated (repeat registrations with unchanged
+    requirements do no network work), and gated on the backend entry point
+    being ABSENT: when one exists, the backend spawn owns provisioning — a
+    module-style builtin entry point in particular must never have an
+    app-dir requirements.txt provisioned (trust boundary; see
+    provision_app_deps). Failure is logged by the provisioner and
+    registration proceeds: the spawn-time import error points back at the
+    provisioning log line, matching the backend spawn's own behavior.
+    """
+    # Provenance gate, not a manifest gate: a shipped BUILTIN's trust story
+    # is the same one the backend spawn's entry gate enforces — builtin code
+    # is trusted package code, its declared dependencies live in the
+    # package's own pyproject, and an agent-planted requirements.txt in the
+    # (writable) app dir must never have pip execute its build hooks under
+    # the gateway without the third-party grant. shipped_builtin_app_root is
+    # the authoritative provenance check (immutable package composition, not
+    # mutable installed.json fields).
+    if shipped_builtin_app_root(app_name) is not None:
+        return
+    root = app_dir(app_name)
+    entry_point = manifest.backend.entryPoint
+    if entry_point:
+        # Registration provisions for FILE-entry apps too, not only
+        # backend-less ones: a healthy fixed-port backend gets ADOPTED
+        # (never spawned this session), so the spawn-path provisioning
+        # never ran and a dependency-backed stdio server would reference an
+        # empty deps tree. The stamp gate and the per-app flock make the
+        # overlap with a real spawn cheap and safe. A MODULE-style entry
+        # (trusted package code, the backend spawn's own trust gate) still
+        # never provisions app-dir requirements.
+        is_module_entry = (
+            "/" not in entry_point
+            and not entry_point.endswith((".py", ".js", ".ts", ".mjs", ".cjs", ".sh"))
+            and "." in entry_point
+            and not (root / entry_point).exists()
+        )
+        if is_module_entry:
+            return
+    if not (root / "requirements.txt").is_file():
+        return
+    has_stdio = any(
+        isinstance(cfg, dict) and not cfg.get("url") for cfg in manifest.mcpServers.values()
+    )
+    if not has_stdio:
+        return
+    # Deferred import: bridges is imported during backend's boot path, so it
+    # cannot import backend at module load (same pattern as the other
+    # backend imports in this module).
+    from kiro_crew.apps.backend import provision_app_deps
+
+    provision_app_deps(app_name, root)
+
+
 def _register_mcp_servers(
     app_name: str, manifest: AppManifest, live_port: int | None = None
 ) -> list[str]:
@@ -2195,6 +2545,7 @@ def _register_mcp_servers(
     if not manifest.mcpServers:
         return []
     resolved_port = _live_port_for(app_name, live_port)
+    _maybe_provision_backendless_deps(app_name, manifest)
     registered: list[str] = []
     skipped: list[str] = []
     # Reconcile guard OUTSIDE _mcp_lock: that order is fixed everywhere, so a health
@@ -2322,9 +2673,7 @@ def reregister_app_mcp_servers(
     return registered
 
 
-def scrub_backend_mcp_url(
-    app_name: str, unreconciled: list[str] | None = None
-) -> list[str]:
+def scrub_backend_mcp_url(app_name: str, unreconciled: list[str] | None = None) -> list[str]:
     """Remove an app's backend-dependent MCP entry, keeping the servers that need no port.
 
     Registering with no live port is the existing path for this: it pops each HTTP entry
@@ -2649,9 +2998,7 @@ def register_app(app_name: str) -> RegistrationResult:
     return result
 
 
-def refresh_app_agents(
-    app_name: str, io_failures: list[str] | None = None
-) -> list[str]:
+def refresh_app_agents(app_name: str, io_failures: list[str] | None = None) -> list[str]:
     """Re-materialize just this app's agent configs.
 
     Called when something the agent config is derived from changes (the app's MCP reach

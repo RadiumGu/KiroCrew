@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
+from kiro_crew import platform_compat
 from kiro_crew.apps.admission import app_admission_denied
 from kiro_crew.apps.discovery import discover_builtin_apps
 from kiro_crew.apps.execution import (
@@ -385,13 +386,26 @@ def _check_path_safety(path: str) -> bool:
 # Build-input / VCS directories never needed at runtime.  The app-kit runtime
 # layout is ``app.json`` + backend code + ``ui/dist/`` — ``node_modules`` is
 # npm build input and ``.git`` comes from cloned registry sources.
+# ``.kirocrew-deps`` (plus its transient staging/prior siblings) is the
+# gateway's own ``pip --target`` provisioning of the app's requirements.txt:
+# machine- and platform-specific, re-provisioned at the destination on first
+# spawn, and copying it would put a foreign wheel tree FIRST on the child's
+# PYTHONPATH, shadowing the correctly provisioned copy.
 # ``shutil.ignore_patterns`` matches by basename at every depth, so both
 # ``node_modules`` and ``ui/node_modules`` are dropped.  ``build`` is
 # deliberately NOT listed: the manifest may reference runtime paths anywhere
 # under the app root, and silently dropping a manifest-referenced directory
 # would record a successful install with missing files.  A ``build`` symlink
 # into a huge build tree is already neutralized by ``symlinks=True``.
-_COPY_IGNORE = ("node_modules", ".git", "__pycache__", ".venv")
+_COPY_IGNORE = (
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".venv",
+    ".kirocrew-deps",
+    ".kirocrew-deps-staging",
+    ".kirocrew-deps-prior",
+)
 
 
 def _copy_app_tree(source: Path, dest: Path) -> None:
@@ -936,6 +950,22 @@ def update_app(
 # ---------------------------------------------------------------------------
 
 
+def _remove_any_shape(path: Path) -> None:
+    """Delete ``path`` whatever it is: tree, file, or dangling link.
+
+    ``shutil.rmtree`` refuses non-directories, so a file-shaped dependency
+    artifact (an app writing a FILE named like a deps tree) would survive
+    every uninstall and poison the next quarantine rename. Links are
+    unlinked, never traversed. Missing is fine.
+    """
+    if platform_compat.is_link_or_junction(path):
+        platform_compat.unlink_link_or_junction(path)
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
 def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
     """Uninstall an app while preserving its ``data/`` directory by default.
 
@@ -995,12 +1025,55 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
             error_code="trust_grant_not_removed",
         )
 
+    quarantined: list[tuple[Path, Path]] = []
     try:
         if keep_data:
             data = dest / "data"
             # Move data to temp, remove app dir, move data back
             tmp_data = dest.parent / f".{name}-data-tmp"
+            if platform_compat.is_link_or_junction(data):
+                # A LINKED data dir would make every operation below act on
+                # the link's TARGET — an app pointing data at another app's
+                # tree (or anywhere else) would have this uninstall rename
+                # and delete a foreign deps tree, and "preserve" the victim's
+                # data as its own. Refuse: the gateway creates data/ as a
+                # real directory, so a link here is never legitimate.
+                raise OSError(
+                    f"app {name!r} data directory is a symlink/junction; "
+                    f"refusing to operate through it"
+                )
             if data.is_dir():
+                # data/ preservation exists for USER data. The gateway's own
+                # generated dependency trees (data/.kirocrew-deps*) must NOT
+                # ride through an uninstall: a compromised app could plant
+                # code there (sitecustomize.py), and a later reinstall under
+                # the same name would prepend it to PYTHONPATH — revoked code
+                # executing in a fresh install. Updates still keep the trees
+                # (update never passes through here). QUARANTINE-RENAME, not
+                # delete: the trees are renamed out of data/ (cheap, same
+                # filesystem) so a later failure in THIS uninstall can put
+                # them back — deleting first would leave a failed uninstall
+                # (app still installed) stripped of its working dependencies.
+                # Deletion happens only after every destructive step
+                # committed. Links are unlinked directly (nothing to restore:
+                # the link's target is untouched); rmtree would refuse them.
+                for gen in (".kirocrew-deps", ".kirocrew-deps-staging", ".kirocrew-deps-prior"):
+                    gen_path = data / gen
+                    if platform_compat.is_link_or_junction(gen_path):
+                        platform_compat.unlink_link_or_junction(gen_path)
+                    elif gen_path.exists():
+                        doomed = dest.parent / f".{name}-deps-doomed{gen}"
+                        # A stale crash leftover at the doomed name can be
+                        # ANY shape (a file-shaped artifact quarantined by a
+                        # prior run — rmtree refuses files, so a plain rmtree
+                        # here would leave it and the rename below would
+                        # fail forever after). Shape-aware, best-effort.
+                        try:
+                            _remove_any_shape(doomed)
+                        except OSError:
+                            pass
+                        gen_path.rename(doomed)
+                        quarantined.append((doomed, gen_path))
                 shutil.move(str(data), str(tmp_data))
             shutil.rmtree(dest)
             if tmp_data.is_dir():
@@ -1008,8 +1081,46 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
                 shutil.move(str(tmp_data), str(data))
         else:
             shutil.rmtree(dest)
+        # Point of commit: every destructive step succeeded, the app is
+        # uninstalled — NOW the quarantined trees die. A tree that resists
+        # deletion here is logged, not fatal: under its doomed name it is
+        # unreachable by any reinstall or PYTHONPATH (the security property
+        # the purge exists for), unlike the silently-preserved live tree the
+        # fail-loud rule targets.
+        for doomed, _orig in quarantined:
+            try:
+                _remove_any_shape(doomed)
+            except OSError as exc:
+                logger.warning(
+                    "Could not delete quarantined deps tree %s after uninstalling %s: %s",
+                    doomed,
+                    name,
+                    exc,
+                )
+        quarantined = []
     except OSError as exc:
-        # The delete failed, so the app is STILL INSTALLED — but its grant was
+        # The delete failed, so the app is STILL INSTALLED — put the
+        # quarantined deps trees back first (best-effort; data may sit at its
+        # temp name mid-move, in which case restore beside it there): a
+        # failed uninstall must not leave a working app stripped of its
+        # provisioned dependencies.
+        for doomed, orig in quarantined:
+            try:
+                target = orig
+                if not orig.parent.exists():
+                    alt = dest.parent / f".{name}-data-tmp" / orig.name
+                    if alt.parent.exists():
+                        target = alt
+                if doomed.exists() and not target.exists():
+                    doomed.rename(target)
+            except OSError as restore_exc:
+                logger.warning(
+                    "Could not restore quarantined deps tree %s for app %s: %s",
+                    doomed,
+                    name,
+                    restore_exc,
+                )
+        # ... and its grant was
         # withdrawn above, which would leave a trusted app silently stripped of the
         # permission the operator gave it, from an operation that did not even
         # succeed. Put it back.
