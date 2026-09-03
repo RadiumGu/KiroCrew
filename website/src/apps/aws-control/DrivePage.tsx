@@ -23,18 +23,18 @@
  * react-query key. All AWS access runs through the gateway's audited CLI
  * chokepoint; this surface never talks to AWS from the browser.
  */
-import { Fragment, useRef, useState } from 'react'
-import { useQuery, useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Fragment, useEffect, useRef, useState } from 'react'
+import { useQuery, useInfiniteQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { Trans } from 'react-i18next'
 import {
   ChevronDown, RefreshCw, Library, Archive, Share2,
-  Download, Trash2, Upload, FolderClosed, FolderPlus, FileText, X,
-  MoreHorizontal, Code, LayoutGrid, List, Search, CloudOff, Plus, AlertTriangle,
+  Download, Trash2, Upload, FolderClosed, FolderOpen, FolderPlus, FileText, X,
+  MoreHorizontal, Code, LayoutGrid, List, Search, CloudOff, Plus, AlertTriangle, Pencil,
 } from 'lucide-react'
 import { Btn, Badge, Toggle, Input, ContentSkeleton, IconButton } from '../../components/ui'
 import {
-  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
 } from '../../components/ui/dropdown-menu'
 import SegmentedControl from '../../components/SegmentedControl'
 import { LibraryTableHead } from '../../components/library/LibraryTable'
@@ -1407,6 +1407,15 @@ const DRIVE_COLUMNS: LibraryColumn[] = [
   { key: '', label: 'apps.awsControl.console.col_modified', className: 'w-[120px]' },
 ]
 
+/** Search hits carry no Kind column: the full relative key already names the
+ *  extension, and the header's job here is to keep the result rows on the same
+ *  grid the folder listing uses so a search does not read as a different page. */
+const SEARCH_COLUMNS: LibraryColumn[] = [
+  { key: '', label: 'apps.awsControl.console.col_name', className: 'min-w-[200px]' },
+  { key: '', label: 'apps.awsControl.console.col_size', className: 'w-[90px]' },
+  { key: '', label: 'apps.awsControl.console.col_modified', className: 'w-[120px]' },
+]
+
 /**
  * The Kind cell for a stored object: its extension, upper-cased.
  *
@@ -1450,13 +1459,259 @@ const KEY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9 ._()+@=-]*$/
  *  name check has no `error`; the sentence is the whole story. */
 type Failure = { message: string; error?: unknown }
 
+/* Preview routes by EXTENSION, not by fetching first: the two transports
+   differ. Media (img/video/audio/iframe tags) load the presigned URL directly
+   — those tags are exempt from CORS, which a browser fetch of the same URL is
+   not (the bucket carries no CORS config). Text goes through the gateway's
+   preview endpoint for the same reason. Anything else gets an honest
+   "download to view" instead of a broken pane. */
+const PREVIEW_IMAGE = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif'])
+const PREVIEW_VIDEO = new Set(['mp4', 'webm', 'm4v', 'mov'])
+const PREVIEW_AUDIO = new Set(['mp3', 'wav', 'm4a', 'ogg', 'flac'])
+const PREVIEW_TEXT = new Set([
+  'txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'log', 'yaml', 'yml', 'xml', 'html', 'css',
+  'js', 'ts', 'tsx', 'jsx', 'py', 'sh', 'toml', 'ini', 'cfg', 'sql', 'go', 'rs', 'java', 'rb',
+])
+
+type PreviewKind = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'none'
+
+function previewKind(key: string): PreviewKind {
+  const ext = key.includes('.') ? (key.split('.').pop() ?? '').toLowerCase() : ''
+  if (PREVIEW_IMAGE.has(ext)) return 'image'
+  if (PREVIEW_VIDEO.has(ext)) return 'video'
+  if (PREVIEW_AUDIO.has(ext)) return 'audio'
+  if (ext === 'pdf') return 'pdf'
+  if (PREVIEW_TEXT.has(ext)) return 'text'
+  return 'none'
+}
+
+/** In-place file preview. Same scrim/panel/focus-trap shape as
+ *  AddFromArtifactsDialog — no third dialog grammar. */
+function PreviewDialog({
+  account, entry, onDownload, downloadError, onClose,
+}: {
+  account: string
+  entry: { key: string; size: number }
+  onDownload: (key: string) => void
+  /** The pane's download failure, when the click came from THIS dialog's
+   *  header: the pane's own notice renders behind the dialog's scrim, so a
+   *  failed download from here would show only a tab flashing closed. */
+  downloadError: Failure | null
+  onClose: () => void
+}) {
+  const kind = previewKind(entry.key)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const backdropDown = useRef(false)
+  useDialogFocusTrap(panelRef, onClose)
+  const [mediaError, setMediaError] = useState(false)
+  const isMedia = kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'pdf'
+  const urlQ = useQuery({
+    queryKey: ['aws-control', 'drive-preview-url', account, entry.key],
+    queryFn: () => awsControlApi.driveDownload(account, 'drive', entry.key),
+    enabled: isMedia,
+    // The presign is minted per open on purpose: it is short-lived, and a
+    // cached URL that outlives its signature renders as a broken image.
+    gcTime: 0,
+    staleTime: 0,
+    retry: false,
+  })
+  /* The download presign is a 60-second grant sized for one click, and a
+     <video>/<audio> keeps issuing ranged GETs for as long as it plays -- so a
+     clip longer than the grant hits S3 403 mid-file. The element reports that
+     as a media error; the response is to re-mint the URL (another short grant,
+     not a longer one) and resume from where playback stopped. Each successful
+     resume re-arms the re-mint, so a clip spanning many grants keeps playing;
+     what stops it is two errors in a row with no media loaded between them --
+     that is a URL that never worked, not a grant that ran out. */
+  const remintPendingRef = useRef(false)
+  const resumeAtRef = useRef(0)
+  const onMediaError = (el?: HTMLMediaElement) => {
+    if (remintPendingRef.current) { setMediaError(true); return }
+    remintPendingRef.current = true
+    resumeAtRef.current = el?.currentTime ?? 0
+    void urlQ.refetch()
+  }
+  const onMediaReady = (e: { currentTarget: HTMLMediaElement }) => {
+    remintPendingRef.current = false
+    if (resumeAtRef.current > 0) {
+      e.currentTarget.currentTime = resumeAtRef.current
+      resumeAtRef.current = 0
+    }
+  }
+  const textQ = useQuery({
+    queryKey: ['aws-control', 'drive-preview-text', account, entry.key],
+    queryFn: () => awsControlApi.drivePreview(account, 'drive', entry.key),
+    enabled: kind === 'text',
+    retry: false,
+  })
+  const name = entry.key.split('/').pop() ?? entry.key
+  const loading = kind === 'text' ? textQ.isLoading : isMedia ? urlQ.isLoading : false
+  const failed = mediaError || (kind === 'text' ? textQ.isError : isMedia ? urlQ.isError : false)
+  /* A `.pdf` key is only renderable when S3 serves it as a PDF. Objects
+     uploaded before content types were set come back as octet-stream, which
+     the sandboxed iframe (no allow-downloads) can neither render nor hand to
+     the browser -- it shows an empty frame and fires no error. The HEAD behind
+     the presign carries the stored type, so those route to the same "cannot
+     be previewed, download it" fallback an unknown extension gets. A missing
+     type (null) is left to the frame: S3 always records one, so null means
+     the field was not reported, not that the object is wrong. */
+  const pdfNotRenderable =
+    kind === 'pdf' && typeof urlQ.data?.contentType === 'string' &&
+    !urlQ.data.contentType.toLowerCase().startsWith('application/pdf')
+  const unsupported = kind === 'none' || pdfNotRenderable
+  const url = urlQ.data?.url
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 sm:p-8"
+      data-testid="drive-preview-dialog"
+      role="presentation"
+      onMouseDown={(e) => { if (e.target === e.currentTarget) backdropDown.current = true }}
+      onClick={(e) => { if (e.target === e.currentTarget && backdropDown.current) onClose(); backdropDown.current = false }}
+    >
+      <div
+        ref={panelRef}
+        className="flex max-h-full w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-lg"
+        role="dialog"
+        aria-modal="true"
+        aria-label={name}
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <FileText size={14} className="shrink-0 text-muted" aria-hidden="true" />
+            <h3 className="truncate text-sm font-semibold text-text-strong">{name}</h3>
+            <span className="shrink-0 text-[11px] text-muted">{fmtBytes(entry.size)}</span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Btn onClick={() => onDownload(entry.key)} data-testid="drive-preview-download">
+              <Download size={13} />{i18nT('apps.awsControl.console.download')}
+            </Btn>
+            <button
+              onClick={onClose}
+              className="cursor-pointer border-none bg-transparent p-0 text-muted hover:text-text"
+              aria-label={i18nT('apps.awsControl.console.close')}
+              data-testid="drive-preview-close"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+        <div className="min-h-[160px] overflow-auto p-4">
+          <AwsErrorNotice
+            error={downloadError?.error}
+            message={downloadError?.message}
+            askAgent
+            className="mb-3"
+            testId="drive-preview-download-error"
+          />
+          {loading && <ContentSkeleton rows={4} />}
+          {/* Two different "nothing to show". An unsupported TYPE is a status,
+              not a failure — nothing was tried — so it stays plain text. A
+              failed load is an error and goes through the shared notice like
+              every other failure in this app: Try again re-issues the read
+              (the presign for media, the gateway read for text), and the
+              hand-off carries the thrown value when there is one. The dialog
+              holds no draft, so the hand-off is always offered. */}
+          {!loading && !failed && unsupported && (
+            <p className="text-[13px] text-muted" data-testid="drive-preview-fallback">
+              {i18nT('apps.awsControl.console.preview_unsupported')}
+            </p>
+          )}
+          {!loading && failed && (
+            <AwsErrorNotice
+              error={kind === 'text' ? textQ.error : urlQ.error}
+              message={i18nT('apps.awsControl.console.preview_failed')}
+              askAgent
+              onRetry={() => {
+                setMediaError(false)
+                remintPendingRef.current = false
+                void (kind === 'text' ? textQ.refetch() : urlQ.refetch())
+              }}
+              testId="drive-preview-error"
+            />
+          )}
+          {!loading && !failed && kind === 'image' && url && (
+            // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is a load-failure hook, not an interaction
+            <img
+              src={url}
+              alt={name}
+              className="mx-auto max-h-[70vh] max-w-full object-contain"
+              onError={() => onMediaError()}
+              data-testid="drive-preview-image"
+            />
+          )}
+          {!loading && !failed && kind === 'video' && url && (
+            // eslint-disable-next-line jsx-a11y/media-has-caption -- user files carry no caption track
+            <video src={url} controls aria-label={name} className="mx-auto max-h-[70vh] max-w-full" onError={(e) => onMediaError(e.currentTarget)} onLoadedMetadata={onMediaReady} data-testid="drive-preview-video" />
+          )}
+          {!loading && !failed && kind === 'audio' && url && (
+            // eslint-disable-next-line jsx-a11y/media-has-caption -- user files carry no caption track
+            <audio src={url} controls aria-label={name} className="w-full" onError={(e) => onMediaError(e.currentTarget)} onLoadedMetadata={onMediaReady} data-testid="drive-preview-audio" />
+          )}
+          {!loading && !failed && kind === 'pdf' && !pdfNotRenderable && url && (
+            // Only reached when the stored Content-Type says PDF (or was not
+            // reported): an octet-stream `.pdf` is routed to the unsupported
+            // fallback above instead of an empty frame. The empty sandbox is
+            // load-bearing: the extension picks this branch, so a `.pdf` key
+            // holding HTML would otherwise run script and could navigate the
+            // top window. Rendering a PDF needs no sandbox permission.
+            <iframe src={url} title={name} sandbox="" className="h-[70vh] w-full rounded border border-border" data-testid="drive-preview-pdf" />
+          )}
+          {!loading && !failed && kind === 'text' && textQ.data && (
+            <>
+              {textQ.data.truncated && (
+                <p className="mb-2 text-[11px] text-muted" data-testid="drive-preview-truncated">
+                  {i18nT('apps.awsControl.console.preview_truncated')}
+                </p>
+              )}
+              {/* The redactor rewrites the text silently; a reader checking a
+                  config file would otherwise take the masked value for the
+                  file's own bytes. Same weight as the truncation note: both say
+                  "this is not the whole file". */}
+              {textQ.data.redacted && (
+                <p className="mb-2 text-[11px] text-muted" data-testid="drive-preview-redacted">
+                  {i18nT('apps.awsControl.console.preview_redacted')}
+                </p>
+              )}
+              <pre className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-text" data-testid="drive-preview-text">
+                {textQ.data.content}
+              </pre>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function DriveSectionView({ account, bucket }: { account: string; bucket: string }) {
   const qc = useQueryClient()
   const [mode, setMode] = useViewMode('drive', 'list')
   const [path, setPath] = useState('')
   const [share, setShare] = useState<{ key: string } | null>(null)
   const [uploadError, setUploadError] = useState<Failure | null>(null)
-  const [downloadError, setDownloadError] = useState<Failure | null>(null)
+  /** Keyed by the object whose download failed, so the preview dialog shows
+   *  only ITS failure: a lingering error from file A must not surface inside
+   *  a later preview of file B as if B's download had failed. */
+  const [downloadError, setDownloadError] = useState<(Failure & { key: string }) | null>(null)
+  const [preview, setPreview] = useState<{ key: string; size: number } | null>(null)
+  const [renaming, setRenaming] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [renameError, setRenameError] = useState('')
+  const [query, setQuery] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  useEffect(() => {
+    // Debounced, not immediate: each keystroke would otherwise fire a full
+    // section walk on the backend. An EMPTIED box is the exception -- there is
+    // no walk to save, and waiting would leave the old query's hits sitting
+    // under an empty field for a beat.
+    if (!query.trim()) {
+      setDebouncedQuery('')
+      return
+    }
+    const t = setTimeout(() => setDebouncedQuery(query.trim()), 300)
+    return () => clearTimeout(t)
+  }, [query])
   const [crumbMenu, setCrumbMenu] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [confirmFolder, setConfirmFolder] = useState<string | null>(null)
@@ -1479,12 +1734,12 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
     setCreatingFolder(false)
   }
   /** Whether a notice on THIS pane may hand off to the agent. The folder-name
-   *  field is the one draft the pane holds, and every notice here — a failed
-   *  listing, upload, move, download or delete — shares the screen with it
-   *  while the disclosure is open. Gated on the disclosure rather than on the
-   *  field having text, so the button does not flicker in and out as the
-   *  reader types. */
-  const handOff = !creatingFolder
+   *  field and an open rename editor are the two drafts the pane can hold, and
+   *  every notice here — a failed listing, search, upload, move, download or
+   *  delete — shares the screen with them while either is open. Gated on the
+   *  disclosure / editor being open rather than on the field having text, so
+   *  the button does not flicker in and out as the reader types. */
+  const handOff = !creatingFolder && renaming === null
   /* How many objects the last folder delete actually removed. One click can
      remove far more than one file, and the count is only knowable AFTER the
      fact - the response carries it, while a figure shown BEFORE consent would
@@ -1517,7 +1772,13 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
      from these, so page boundaries stay invisible to the reader. */
   const folders = (listQ.data?.pages ?? []).flatMap((pg) => pg.folders)
   const files = (listQ.data?.pages ?? []).flatMap((pg) => pg.files)
-  const invalidate = () => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
+  // Search results are a second view of the same objects: a delete, upload
+  // or folder change from the results must refresh them too, or the hit the
+  // reader just removed stays on screen.
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
+    qc.invalidateQueries({ queryKey: ['aws-control', 'drive-search', account] })
+  }
 
   const uploadMut = useMutation({
     // The KEY is the caller's, not derived from the browse path here: the
@@ -1608,7 +1869,7 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
     onSuccess: () => {
       setMoveError(null)
       qc.invalidateQueries({ queryKey: ['aws-control', 'drive-list', account] })
-      qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
+      invalidate()
     },
     onError: (e: unknown) => {
       // Two refusals worth their own sentences: share_active (the source has
@@ -1630,6 +1891,97 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
   /** The wire format an internal file drag travels as. A custom MIME keeps OS
    *  file drops (types includes 'Files') and internal moves distinguishable. */
   const DRAG_MIME = 'application/x-drive-object-key'
+
+  /* Rename IS a move with the directory held fixed — the backend endpoint is
+     the same one, so every move guarantee (no overwrite, live-share refusal)
+     applies to a rename for free; only the refusal WORDING is rename's own. */
+  const renameMut = useMutation({
+    mutationFn: ({ fromKey, toKey }: { fromKey: string; toKey: string }) =>
+      awsControlApi.driveMove(account, 'drive', fromKey, toKey),
+    onSuccess: () => {
+      setRenaming(null)
+      setRenameError('')
+      qc.invalidateQueries({ queryKey: ['aws-control', 'drive-list', account] })
+      // A rename from a search hit must re-run the search so the new name
+      // (or the hit's disappearance, if it no longer matches) shows.
+      invalidate()
+    },
+    onError: (e: unknown) => {
+      const err = e instanceof AwsControlError ? e : null
+      // Same error CODES as move (it is the move endpoint), but the sentences
+      // name the verb the user pressed: a failed rename that talks about a
+      // "destination folder" reads as a move they never made.
+      setRenameError(i18nT(
+        err?.message === 'share_active'
+          ? 'apps.awsControl.console.rename_shared'
+          : err?.status === 409
+            ? 'apps.awsControl.console.rename_conflict'
+            : 'apps.awsControl.console.rename_failed'))
+    },
+  })
+
+  const openRename = (key: string) => {
+    setRenaming(key)
+    setRenameValue(key.split('/').pop() ?? key)
+    setRenameError('')
+  }
+
+  const closeRename = () => {
+    // Same in-flight guard the folder disclosure carries: a close while the
+    // move is mid-flight would discard the name being committed.
+    if (renameMut.isPending) return
+    setRenaming(null)
+    setRenameError('')
+    renameMut.reset()
+  }
+
+  /* A query change swaps the whole view (folder listing <-> search hits), and
+     any in-place editor open under a row goes with it. Left as-is, `renaming`
+     would stay set for a row that no longer renders: the half-typed name is
+     gone with no word, and `handOff` keeps every later notice from offering the
+     agent. So the editors close with the view they belonged to. The in-flight
+     guard inside closeRename still applies -- a commit mid-flight finishes. */
+  useEffect(() => {
+    closeRename()
+    setConfirmDelete(null)
+    // Keyed on the debounced query alone: that is the value the view switches on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedQuery])
+
+  const commitRename = (fromKey: string) => {
+    // The name is committed AS TYPED. Trimming it would silently move a file
+    // whose name legitimately ends in a space (the key grammar allows one) the
+    // moment its owner opens Rename and saves without touching anything — a
+    // no-op that changes the key. Whitespace-only is the one shape refused,
+    // and the key grammar below rejects a leading space on its own.
+    const name = renameValue
+    if (!name.trim()) return
+    const base = fromKey.split('/').pop() ?? fromKey
+    if (name === base) {
+      closeRename()
+      return
+    }
+    if (!KEY_SEGMENT.test(name)) {
+      // Rename's own wording: the shared upload message says "Rename it and
+      // try again", which inside the rename editor tells the reader to do the
+      // thing they are already doing.
+      setRenameError(i18nT('apps.awsControl.console.rename_bad_name'))
+      return
+    }
+    const dir = fromKey.split('/').slice(0, -1).join('/')
+    setRenameError('')
+    renameMut.mutate({ fromKey, toKey: dir ? `${dir}/${name}` : name })
+  }
+
+  const searching = debouncedQuery.length > 0
+  const searchQ = useQuery({
+    queryKey: ['aws-control', 'drive-search', account, debouncedQuery],
+    queryFn: () => awsControlApi.driveSearch(account, 'drive', debouncedQuery),
+    enabled: searching,
+    // Each refinement is a new key; without this "rep" -> "report" blanks the
+    // list the user is scanning back to a skeleton for the round-trip.
+    placeholderData: keepPreviousData,
+  })
 
   /** The key of the drag THIS component started, or null. The drop handler
    *  trusts this ref, never the DataTransfer payload: drag data is
@@ -1679,6 +2031,23 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
     },
   })
 
+  /** What the section carries while a search is active: the drop is swallowed
+   *  (preventDefault, so the browser never navigates to a dropped file) and
+   *  nothing is uploaded, because the folder it would land in is off-screen.
+   *  The drag-over highlight stays off too -- a highlighted target that does
+   *  nothing on release would read as a failed upload. */
+  const inertDropProps = {
+    onDragOver: (e: React.DragEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+    },
+    onDrop: (e: React.DragEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      dragKeyRef.current = null
+    },
+  }
+
   /** Draggable wiring for a file row/tile. */
   const dragProps = (key: string) => ({
     draggable: true,
@@ -1718,24 +2087,64 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
       // from an onClick with no catch, so a rethrow becomes an unhandled
       // rejection that tells the USER nothing. Report it in the row instead.
       tab?.close()
-      setDownloadError({ message: i18nT('apps.awsControl.console.download_failed'), error: e })
+      setDownloadError({ message: i18nT('apps.awsControl.console.download_failed'), error: e, key })
     }
   }
 
   const crumbs = path.split('/').filter(Boolean)
 
   return (
-    <section data-testid="drive-section" {...dropProps(path)} className={dropTarget === path ? 'rounded-lg ring-1 ring-inset ring-accent' : undefined}>
+    <section
+      data-testid="drive-section"
+      /* The section-level drop targets the OPEN folder, which search hides
+         along with its crumbs -- the same invisible-destination problem the
+         toolbar's Upload button has, so the drop goes INERT while searching.
+         Inert, not absent: this section is the page's only dragover/drop
+         preventDefault, and without one the browser answers a dropped OS file
+         by navigating the tab to it, tearing down the dashboard for a gesture
+         this same surface trained. */
+      {...(searching ? inertDropProps : dropProps(path))}
+      className={!searching && dropTarget === path ? 'rounded-lg ring-1 ring-inset ring-accent' : undefined}
+    >
       <PaneHeader icon={<FolderClosed size={18} />} title={i18nT('apps.awsControl.console.section_files')} actions={
         <div className="flex flex-wrap items-center gap-2">
-        <ViewModeToggle section="drive" mode={mode} onChange={setMode} />
+        <div className="relative">
+          <Search size={13} aria-hidden="true" className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted" />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Escape') setQuery('') }}
+            placeholder={i18nT('apps.awsControl.console.search_files')}
+            aria-label={i18nT('apps.awsControl.console.search_files')}
+            className="w-full pl-7 pr-6 sm:w-[260px]"
+            data-testid="drive-search-input"
+          />
+          {query && (
+            <button
+              type="button"
+              onClick={() => setQuery('')}
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 cursor-pointer border-none bg-transparent p-0 text-muted hover:text-text"
+              aria-label={i18nT('apps.awsControl.console.search_clear')}
+              data-testid="drive-search-clear"
+            >
+              <X size={12} />
+            </button>
+          )}
+        </div>
+        {/* Search replaces the folder view and hides the crumbs, so the two
+            folder-scoped WRITE controls go with them: an upload or a new folder
+            mid-search would land in a folder the reader cannot see, succeed,
+            and show nothing. The view toggle goes too -- results are always a
+            table, so a toggle that visibly does nothing reads as broken. The
+            search box stays: clearing it is how the reader gets back. */}
+        {!searching && <ViewModeToggle section="drive" mode={mode} onChange={setMode} />}
         {/* The name field appears when the reader ASKS to create a folder.
             Parked permanently in the toolbar it was two dead controls (an empty
             input and a disabled button) on every visit that isn't about
             folders — which is most of them. Escape, Cancel, or blurring the
             empty field puts the toolbar back; Upload hides while creating so
             the expanded row stays one action group of two buttons. */}
-        {creatingFolder ? (
+        {searching ? null : creatingFolder ? (
           <>
             <Input
               value={newFolder}
@@ -1815,7 +2224,7 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
           ancestors go into the same inline overflow the file rows use, which
           keeps the jump-to-an-ancestor navigation that rendering the whole path
           as flat text would have removed. */}
-      {crumbs.length > 0 && (
+      {!searching && crumbs.length > 0 && (
       <div className="mb-2 flex flex-wrap items-center gap-1 text-[12px] text-muted" data-testid="drive-crumbs">
         <button className="hover:text-text cursor-pointer bg-transparent border-none p-0" onClick={() => setPath('')}>
           {i18nT('apps.awsControl.console.section_files')}
@@ -1851,7 +2260,220 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
       </div>
       )}
 
-      {listQ.isLoading && <ContentSkeleton rows={2} />}
+      {/* Search replaces the folder view wholesale: results span the WHOLE
+          section (the full relative key is shown), so rendering them beside
+          one folder's crumbs would claim a scope the listing does not have. */}
+      {searching && (
+        <div data-testid="drive-search-results">
+          {searchQ.isLoading && <ContentSkeleton rows={2} />}
+          {/* A refinement ("rep" -> "report") keeps the PREVIOUS query's rows on
+              screen through `keepPreviousData`, so without a pending signal
+              they read as the new answer for the whole section walk. The stale
+              set dims and the line below names what is happening. */}
+          {searchQ.isFetching && !searchQ.isLoading && (
+            <p className="mb-2 flex items-center gap-1.5 text-[11px] text-muted" data-testid="drive-search-pending" role="status">
+              <RefreshCw size={11} className="animate-spin" aria-hidden="true" />
+              {i18nT('apps.awsControl.console.search_pending')}
+            </p>
+          )}
+          {/* A failed search is a READ the reader can re-issue, so it carries
+              Try again like the listing's own failure, and hands off to the
+              agent under the same draft gate every notice on this pane uses. */}
+          <AwsErrorNotice
+            error={searchQ.error}
+            message={searchQ.isError ? i18nT('apps.awsControl.console.search_failed') : null}
+            askAgent={handOff}
+            onRetry={() => searchQ.refetch()}
+            className="mb-2"
+            testId="drive-search-error"
+          />
+          <div className={searchQ.isFetching && !searchQ.isLoading ? 'opacity-60 transition-opacity' : undefined} aria-busy={searchQ.isFetching && !searchQ.isLoading ? true : undefined} data-testid="drive-search-body">
+          {searchQ.isSuccess && searchQ.data.results.length === 0 && (
+            <p className="text-[13px] text-muted" data-testid="drive-search-empty">
+              {i18nT('apps.awsControl.console.search_no_results', { query: debouncedQuery })}
+            </p>
+          )}
+          {searchQ.isSuccess && searchQ.data.capped && (
+            <p className="mb-2 text-[11px] text-muted" data-testid="drive-search-capped">
+              {i18nT('apps.awsControl.console.search_capped', { count: searchQ.data.limit })}
+            </p>
+          )}
+          {searchQ.isSuccess && searchQ.data.results.length > 0 && (
+            <div className="overflow-x-auto" data-testid="drive-search-table">
+              <table className="w-full border-collapse text-[13px]">
+                <LibraryTableHead
+                  sort={null}
+                  onSort={noSort}
+                  columns={SEARCH_COLUMNS}
+                  actionsLabelKey="apps.awsControl.console.col_actions"
+                />
+                <tbody>
+                  {searchQ.data.results.map((hit) => (
+                    <Fragment key={hit.key}>
+                    <tr className="border-b border-border last:border-0 hover:bg-bg-hover" data-testid="drive-search-hit">
+                      <td className="px-2.5 py-2">
+                        <button
+                          type="button"
+                          onClick={() => setPreview({ key: hit.key, size: hit.size })}
+                          className="flex min-w-0 max-w-full cursor-pointer items-center gap-2 border-none bg-transparent p-0 text-left text-text hover:underline"
+                          title={hit.key}
+                          data-testid="drive-search-open"
+                        >
+                          <FileText size={14} className="shrink-0 text-muted" aria-hidden="true" />
+                          {/* The FULL relative key, not the basename: results
+                              come from the whole section, and the path is what
+                              tells two same-named files apart. The FOLDER half
+                              is what truncates on a long path -- the basename
+                              is what the reader searched for, so it stays
+                              whole -- and the title carries the untruncated key. */}
+                          <span className="flex min-w-0">
+                            {hit.key.includes('/') && (
+                              <span className="truncate text-muted">{hit.key.slice(0, hit.key.lastIndexOf('/') + 1)}</span>
+                            )}
+                            <span className="shrink-0">{hit.key.slice(hit.key.lastIndexOf('/') + 1)}</span>
+                          </span>
+                        </button>
+                      </td>
+                      <td className="px-2.5 py-2 text-muted">{fmtBytes(hit.size)}</td>
+                      <td className="px-2.5 py-2 text-muted">{fmtRelative(hit.modified)}</td>
+                      <td className="px-2.5 py-2">
+                        {/* Same one-overflow grammar as the file rows, and the
+                            SAME items: a reader who searched in order to rename
+                            or delete a file must not have to leave the results
+                            and re-find it. Rename, Share and Delete all key off
+                            the object's own path, so they need no folder
+                            context; Open containing folder is the one hit-only
+                            item. The go-to action is a WORDED item -- a bare
+                            folder icon on this page means "a folder object",
+                            not a verb. */}
+                        <div className="flex items-center justify-end gap-1">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <button
+                                type="button"
+                                className="p-1 rounded text-muted hover:text-text transition-colors cursor-pointer bg-transparent border-none"
+                                aria-label={i18nT('apps.awsControl.console.file_actions')}
+                                data-testid="drive-search-more"
+                              >
+                                <MoreHorizontal size={14} />
+                              </button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem onSelect={() => download(hit.key)} data-testid="drive-search-download">
+                                <Download size={13} />{i18nT('apps.awsControl.console.download')}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onSelect={() => openRename(hit.key)} data-testid="drive-search-rename">
+                                <Pencil size={13} />{i18nT('apps.awsControl.console.rename')}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onSelect={() => setShare({ key: hit.key })} data-testid="drive-search-share">
+                                <Share2 size={13} />{i18nT('apps.awsControl.console.share')}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onSelect={() => {
+                                  setPath(hit.key.split('/').slice(0, -1).join('/'))
+                                  setQuery('')
+                                }}
+                                data-testid="drive-search-goto"
+                              >
+                                <FolderOpen size={13} />{i18nT('apps.awsControl.console.search_goto')}
+                              </DropdownMenuItem>
+                              {/* The destructive item sits alone below a rule: the
+                                  likeliest action from a hit (go to its folder) must
+                                  not be a slip away from Delete at identical weight. */}
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem onSelect={() => setConfirmDelete(hit.key)} data-testid="drive-search-delete">
+                                <Trash2 size={13} />{i18nT('apps.awsControl.console.delete')}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+                      </td>
+                    </tr>
+                    {/* The same in-place editors the folder listing opens under
+                        its rows, so the flow from a search hit is identical:
+                        the rename commits against the hit's OWN directory, and
+                        both mutations refresh the results. */}
+                    {renaming === hit.key && (
+                      // eslint-disable-next-line jsx-a11y/control-has-associated-label -- the row's control is the Input, which carries its own aria-label; the rule cannot see through the component wrapper
+                      <tr className="border-b border-border bg-bg-elevated" data-testid="drive-rename-row">
+                        <td colSpan={SEARCH_COLUMNS.length + 1} className="px-2.5 py-2">
+                          <div className="flex flex-wrap items-center gap-2 pr-4">
+                            <Input
+                              value={renameValue}
+                              onChange={(e) => setRenameValue(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') commitRename(hit.key)
+                                if (e.key === 'Escape') closeRename()
+                              }}
+                              autoFocus
+                              aria-label={i18nT('apps.awsControl.console.rename')}
+                              className="w-full min-w-0 sm:w-[260px]"
+                              data-testid="drive-rename-input"
+                            />
+                            {/* No hand-off: beside a live input, and the agent
+                                navigation would take the half-typed name with it. */}
+                            <AwsErrorNotice message={renameError} askAgent={false} variant="inline" testId="drive-rename-error" />
+                            <Btn onClick={closeRename} disabled={renameMut.isPending} data-testid="drive-rename-cancel">
+                              {i18nT('apps.awsControl.console.cancel')}
+                            </Btn>
+                            <Btn
+                              primary
+                              disabled={renameMut.isPending || !renameValue.trim()}
+                              onClick={() => commitRename(hit.key)}
+                              data-testid="drive-rename-save"
+                            >
+                              <Pencil size={13} />{i18nT('apps.awsControl.console.rename')}
+                            </Btn>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    {confirmDelete === hit.key && (
+                      // eslint-disable-next-line jsx-a11y/control-has-associated-label -- the row's text is the confirmation sentence in the span below, one level deeper than the rule's default search depth
+                      <tr className="border-b border-border bg-bg-elevated" data-testid="drive-delete-confirm">
+                        <td colSpan={SEARCH_COLUMNS.length + 1} className="px-2.5 py-2">
+                          <div className="flex flex-wrap items-center gap-2 pr-4">
+                            <span className="min-w-0 flex-1 text-text">
+                              {/* The FULL relative key, unlike the folder rows: search
+                                  is the one view where same-named files from different
+                                  folders sit side by side, and the basename alone would
+                                  not say which one is about to go. */}
+                              {i18nT('apps.awsControl.console.delete_confirm', { name: hit.key })}
+                            </span>
+                            <AwsErrorNotice
+                              askAgent={handOff}
+                              error={deleteMut.error}
+                              message={deleteMut.isError ? i18nT('apps.awsControl.console.delete_failed') : null}
+                              variant="inline"
+                              className="basis-full"
+                              testId="drive-delete-error"
+                            />
+                            <Btn onClick={() => setConfirmDelete(null)} data-testid="drive-delete-cancel">
+                              {i18nT('apps.awsControl.console.cancel')}
+                            </Btn>
+                            <Btn
+                              danger
+                              disabled={deleteMut.isPending}
+                              onClick={() => deleteMut.mutate(hit.key, { onSuccess: () => setConfirmDelete(null) })}
+                              data-testid="drive-delete-confirm-action"
+                            >
+                              <Trash2 size={13} />{i18nT('apps.awsControl.console.delete_confirm_action')}
+                            </Btn>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          </div>
+        </div>
+      )}
+
+      {!searching && listQ.isLoading && <ContentSkeleton rows={2} />}
 
       {/* A failed listing is not an empty folder — the Library folder beside
           this one already says so, and this one rendered NOTHING: no skeleton,
@@ -1870,7 +2492,7 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
           question was asked in exactly those words. So the empty state names
           what belongs here and how it differs from Library, and carries the
           upload action rather than making the reader find it in the header. */}
-      {listQ.isSuccess && folders.length === 0 && files.length === 0 && (
+      {!searching && listQ.isSuccess && folders.length === 0 && files.length === 0 && (
         <div className="rounded-lg border border-dashed border-border p-8 text-center" data-testid="drive-empty">
           <div className="mb-1.5 text-[13px] font-medium text-text-strong">
             {i18nT('apps.awsControl.console.files_empty_title')}
@@ -1893,7 +2515,7 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
           choice persists per section a reader who preferred tiles would
           otherwise lose Share and Delete on every future visit with nothing to
           tell them the controls existed. */}
-      {mode === 'grid' && (folders.length > 0 || files.length > 0) && (
+      {!searching && mode === 'grid' && (folders.length > 0 || files.length > 0) && (
         <div className="-mr-3" data-testid="drive-grid">
           <div className="grid items-start" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(258px, 1fr))' }}>
             {folders.map((name) => {
@@ -2003,6 +2625,9 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
                       <DropdownMenuItem onSelect={() => download(f.key)} data-testid="drive-grid-download">
                         <Download size={13} />{i18nT('apps.awsControl.console.download')}
                       </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => openRename(f.key)} data-testid="drive-grid-rename">
+                        <Pencil size={13} />{i18nT('apps.awsControl.console.rename')}
+                      </DropdownMenuItem>
                       <DropdownMenuItem onSelect={() => setShare({ key: f.key })} data-testid="drive-grid-share">
                         <Share2 size={13} />{i18nT('apps.awsControl.console.share')}
                       </DropdownMenuItem>
@@ -2012,7 +2637,19 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </div>
-                <span className="w-full truncate text-[13px] font-medium text-text-strong">{f.key.split('/').pop()}</span>
+                {/* The name is the preview trigger; while its rename editor is
+                    open the editor IS the name, and a preview opened over it
+                    would stack two editing contexts on one tile. */}
+                {renaming !== f.key && (
+                  <button
+                    type="button"
+                    onClick={() => setPreview({ key: f.key, size: f.size })}
+                    className="w-full cursor-pointer truncate border-none bg-transparent p-0 text-left text-[13px] font-medium text-text-strong hover:underline"
+                    data-testid="drive-grid-preview-open"
+                  >
+                    {f.key.split('/').pop()}
+                  </button>
+                )}
                 <span className="text-[11px] text-muted">
                   {/* A dash is the ABSENCE of a kind, not a kind -- do not print
                       it as one beside the size. */}
@@ -2030,13 +2667,43 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
                     action={i18nT('apps.awsControl.console.delete_confirm_action')}
                   />
                 )}
+                {renaming === f.key && (
+                  <div className="flex w-full flex-wrap items-center gap-2" data-testid="drive-grid-rename-row">
+                    <Input
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') commitRename(f.key)
+                        if (e.key === 'Escape') closeRename()
+                      }}
+                      autoFocus
+                      aria-label={i18nT('apps.awsControl.console.rename')}
+                      className="w-full min-w-0"
+                      data-testid="drive-grid-rename-input"
+                    />
+                    {/* No hand-off: beside a live input, and the agent
+                        navigation would take the half-typed name with it. */}
+                    <AwsErrorNotice message={renameError} askAgent={false} variant="inline" testId="drive-grid-rename-error" />
+                    <Btn onClick={closeRename} disabled={renameMut.isPending} data-testid="drive-grid-rename-cancel">
+                      {i18nT('apps.awsControl.console.cancel')}
+                    </Btn>
+                    <Btn
+                      primary
+                      disabled={renameMut.isPending || !renameValue.trim()}
+                      onClick={() => commitRename(f.key)}
+                      data-testid="drive-grid-rename-save"
+                    >
+                      <Pencil size={13} />{i18nT('apps.awsControl.console.rename')}
+                    </Btn>
+                  </div>
+                )}
               </div>
             ))}
           </div>
         </div>
       )}
 
-      {mode === 'list' && (folders.length > 0 || files.length > 0) && (
+      {!searching && mode === 'list' && (folders.length > 0 || files.length > 0) && (
         /* Borderless, the stock shadcn table posture: row dividers only, no
            frame and no card fill — the heavy outer border read as chrome on a
            page that is mostly this one table. The div stays: it is the
@@ -2185,10 +2852,15 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
                 <Fragment key={`o-${f.key}`}>
                   <tr {...dragProps(f.key)} className="border-b border-border last:border-0 hover:bg-bg-hover" data-testid="drive-file">
                     <td className="px-2.5 py-2">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <FileText size={14} className="shrink-0 text-muted" />
-                        <span className="truncate text-text">{f.key.split('/').pop()}</span>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setPreview({ key: f.key, size: f.size })}
+                        className="flex min-w-0 max-w-full cursor-pointer items-center gap-2 border-none bg-transparent p-0 text-left"
+                        data-testid="drive-preview-open"
+                      >
+                        <FileText size={14} className="shrink-0 text-muted" aria-hidden="true" />
+                        <span className="truncate text-text hover:underline">{f.key.split('/').pop()}</span>
+                      </button>
                     </td>
                     <td className="px-2.5 py-2 text-muted">{objectKind(f.key)}</td>
                     <td className="px-2.5 py-2 text-muted">{fmtBytes(f.size)}</td>
@@ -2224,6 +2896,9 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
                             <DropdownMenuItem onSelect={() => download(f.key)} data-testid="drive-download">
                               <Download size={13} />{i18nT('apps.awsControl.console.download')}
                             </DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => openRename(f.key)} data-testid="drive-rename">
+                              <Pencil size={13} />{i18nT('apps.awsControl.console.rename')}
+                            </DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => setShare({ key: f.key })} data-testid="drive-share">
                               <Share2 size={13} />{i18nT('apps.awsControl.console.share')}
                             </DropdownMenuItem>
@@ -2235,6 +2910,41 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
                       </div>
                     </td>
                   </tr>
+                  {renaming === f.key && (
+                    // eslint-disable-next-line jsx-a11y/control-has-associated-label -- the row's control is the Input, which carries its own aria-label; the rule cannot see through the component wrapper
+                    <tr className="border-b border-border bg-bg-elevated" data-testid="drive-rename-row">
+                      <td colSpan={5} className="px-2.5 py-2">
+                        <div className="sticky left-0 flex max-w-[calc(100vw-2.5rem)] flex-wrap items-center gap-2 pr-4">
+                          <Input
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') commitRename(f.key)
+                              if (e.key === 'Escape') closeRename()
+                            }}
+                            autoFocus
+                            aria-label={i18nT('apps.awsControl.console.rename')}
+                            className="w-full min-w-0 sm:w-[260px]"
+                            data-testid="drive-rename-input"
+                          />
+                          {/* Beside a live input, so no agent hand-off: the
+                              navigation would take the half-typed name with it. */}
+                          <AwsErrorNotice message={renameError} askAgent={false} variant="inline" testId="drive-rename-error" />
+                          <Btn onClick={closeRename} disabled={renameMut.isPending} data-testid="drive-rename-cancel">
+                            {i18nT('apps.awsControl.console.cancel')}
+                          </Btn>
+                          <Btn
+                            primary
+                            disabled={renameMut.isPending || !renameValue.trim()}
+                            onClick={() => commitRename(f.key)}
+                            data-testid="drive-rename-save"
+                          >
+                            <Pencil size={13} />{i18nT('apps.awsControl.console.rename')}
+                          </Btn>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
                   {confirmDelete === f.key && (
                     <tr className="border-b border-border bg-bg-elevated" data-testid="drive-delete-confirm">
                       <td colSpan={5} className="px-2.5 py-2">
@@ -2274,7 +2984,7 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
         </div>
       )}
 
-      {listQ.hasNextPage && (
+      {!searching && listQ.hasNextPage && (
         <div className="mt-2">
           <Btn
             onClick={() => listQ.fetchNextPage()}
@@ -2290,6 +3000,15 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
 
       {share && (
         <ShareDialog account={account} section="drive" fileKey={share.key} onClose={() => setShare(null)} />
+      )}
+      {preview && (
+        <PreviewDialog
+          account={account}
+          entry={preview}
+          onDownload={download}
+          downloadError={downloadError?.key === preview.key ? downloadError : null}
+          onClose={() => setPreview(null)}
+        />
       )}
     </section>
   )
