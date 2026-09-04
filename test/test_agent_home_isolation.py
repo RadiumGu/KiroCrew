@@ -727,7 +727,22 @@ _LITERAL_RE = re.compile(r'"\.kiro"\s*/\s*"agents"' r"|[\"']\.kiro/agents")
 # for that entry, so it cannot reintroduce the reader/writer split-brain this
 # guard exists to catch; ``TestKiroAgentsDirWriteProtection`` pins the literal to
 # ``kiro_agents_dir()`` so drift still fails loudly.
-_ALLOWED = {"config/paths.py", "security.py"}
+_ALLOWED = {
+    "config/paths.py",
+    "security.py",
+    # The AWS Control crew's container is a third case, and a different kind. It
+    # runs as its own process inside a Linux image where ``kiro_crew`` is not
+    # importable, so ``supervisor/bundle.py`` re-implements this resolver instead
+    # of calling it -- the same constraint that made the front's slot-id guard a
+    # shape test rather than an import. The exempt file is that module's own TEST,
+    # which asserts what the re-implementation returns: it neither reads nor writes
+    # the directory, and a test forbidden from naming the expected path could not
+    # detect the drift this guard exists to catch.
+    # ``test_the_container_resolver_matches_kiro_home`` pins the duplicate to
+    # ``kiro_home()`` so it cannot drift silently -- the same bargain
+    # ``security.py`` gets above.
+    "apps/builtins/aws_control/crew/runtime/container_tests/test_supervisor_bundle.py",
+}
 
 
 def test_no_new_hardcoded_global_agents_dir():
@@ -754,6 +769,72 @@ def test_no_new_hardcoded_global_agents_dir():
     assert (
         not offenders
     ), "hard-coded global agents dir — use kiro_agents_dir() instead:\n" + "\n".join(offenders)
+
+
+def test_the_container_resolver_matches_kiro_home():
+    """The crew container re-implements ``kiro_home``; pin the duplicate to it.
+
+    ``supervisor/bundle.py`` cannot import ``kiro_crew``: it runs as its own
+    process inside a Linux image built from the crew source, where the package is
+    not on the path. So it re-derives ``$KIRO_HOME`` else ``~/.kiro``, then
+    ``/agents``. That is a sanctioned duplicate rather than an oversight, and the
+    price of the exemption above is this test -- two implementations of one rule
+    drift, and the drift here would be a container reading agent specs from a
+    directory nothing wrote.
+
+    Compared by BEHAVIOUR under both branches of the override rather than by
+    reading the source, because a copy that merely looks similar is what this is
+    meant to catch.
+    """
+    import os
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    from kiro_crew.config.paths import kiro_home
+
+    # Imported as ``container.supervisor.bundle``, the way the image does it: the
+    # module uses relative imports, so loading the file standalone fails. The build
+    # context is what sits on sys.path inside the container.
+    runtime = SRC / "apps/builtins/aws_control/crew/runtime"
+    added = str(runtime) not in sys.path
+    if added:
+        sys.path.append(str(runtime))
+    try:
+        from container.supervisor import bundle as mod
+    except Exception as exc:  # pragma: no cover - a real breakage, not a skip
+        raise AssertionError(
+            f"the container's bundle module no longer imports ({exc}); this pin "
+            "cannot verify the duplicate resolver"
+        ) from exc
+
+    saved = os.environ.get("KIRO_HOME")
+    try:
+        os.environ.pop("KIRO_HOME", None)
+        assert (
+            mod.default_kiro_agents_dir() == kiro_home() / "agents"
+        ), "the container resolver disagrees with kiro_home() with no override set"
+        # With an override: both must follow it, which is the whole point of the
+        # override existing and the half most likely to be dropped by a copy.
+        #
+        # The probe is an absolute path under the system temp dir, NOT one built
+        # from ``Path.home()``. ``kiro_home()`` calls ``.resolve()`` and the
+        # container does not, so on a machine whose home is itself a symlink a
+        # home-derived probe makes the two disagree on the LINK rather than on the
+        # rule. The first version of this test failed for exactly that reason.
+        os.environ["KIRO_HOME"] = str(Path(tempfile.gettempdir()) / "kiro-home-pin-probe")
+        assert (
+            mod.default_kiro_agents_dir() == kiro_home() / "agents"
+        ), "the container resolver ignores KIRO_HOME while kiro_home() honors it"
+    finally:
+        if saved is None:
+            os.environ.pop("KIRO_HOME", None)
+        else:
+            os.environ["KIRO_HOME"] = saved
+        # Leave sys.path as found: that directory carries a ``tests`` package, and
+        # leaving it behind is the collision that broke two Windows shards earlier.
+        if added and str(runtime) in sys.path:
+            sys.path.remove(str(runtime))
 
 
 def test_repo_has_no_python_syntax_regression():
