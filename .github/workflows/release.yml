@@ -720,10 +720,62 @@ jobs:
       # and Gatekeeper verification. The unsigned electron-builder zip/DMG are
       # inter-job inputs only and must never become GitHub Release assets.
       - name: Assemble release assets (require gated macOS artifacts)
+        env:
+          CHANNEL: ${{ needs.version.outputs.channel }}
         run: |
           set -euo pipefail
           mkdir -p release
           find artifacts -type f \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release/ \;
+
+          # The symbols pin has to outlive the build that wrote it. Each desktop
+          # leg uploads symbols-manifest.json into its own CI artifact, and that
+          # artifact expires in 14 days -- but the crash reports it exists to
+          # decode arrive from users on released builds, months later. A GitHub
+          # Release asset does not expire, so the pin travels with the release it
+          # describes. A few hundred bytes each.
+          #
+          # Renamed per leg on the way in: every artifact holds a file with the
+          # same basename, and `release/` is flat, so a plain copy would leave
+          # one arbitrary winner and silently drop the rest.
+          manifests=0
+          for manifest in artifacts/*/symbols-manifest.json; do
+            [ -e "$manifest" ] || continue
+            slug="$(basename "$(dirname "$manifest")")"
+            slug="${slug#unsigned-}"
+            slug="${slug#build-}"
+            cp "$manifest" "release/symbols-manifest-${slug}.json"
+            manifests=$((manifests + 1))
+          done
+          # Fail closed -- but only for the channel that builds. On insider the
+          # desktop legs demonstrably ran (the gated macOS assets below are
+          # required), so zero manifests means the emit step stopped producing
+          # one: a green build shipping undecodable crash reports, which is the
+          # failure this file exists to make impossible rather than unlikely.
+          #
+          # Stable is exempt because a manifest there proves nothing about what
+          # stable publishes. `build-desktop` is `if: channel == 'insider'`
+          # (line 326), so a stable run builds no macOS or Linux leg at all -- it
+          # promotes the exact bytes of an already-released insider build, whose
+          # pin already sits permanently on that insider release. What a stable
+          # run does still carry is `build-windows`'s manifest, since that leg has
+          # no channel condition and runs on both; the loop above copies it, and
+          # the guard deliberately does not treat its presence as evidence.
+          # Requiring one here would red every stable release whose Windows leg
+          # soft-failed and publish no Release page at all: precisely the v0.3.0
+          # incident this job's own comment above records, re-introduced by the
+          # check meant to prevent a different silent loss.
+          #
+          # Known limit, stated rather than implied: this counts manifests, so on
+          # insider the Windows leg alone satisfies it and a macOS leg that
+          # silently stopped emitting one would still pass. Closing that needs a
+          # per-lane expectation keyed off which legs ran, which is a bigger
+          # change than the loss it prevents; the count still catches the emit
+          # step breaking outright, which is how it would actually break.
+          if [ "$CHANNEL" = "insider" ] && [ "$manifests" -eq 0 ]; then
+            echo "::error::No symbols-manifest.json found in any build artifact;" \
+                 "see the 'Record symbols manifest' step in build-desktop.yml."
+            exit 1
+          fi
 
           NOTARIZED_DIR="artifacts/KiroCrew-notarized-${{ needs.version.outputs.channel }}-${{ needs.version.outputs.version }}"
           NOTARIZED_ZIP="${NOTARIZED_DIR}/notarized.zip"

@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+
 pytestmark = pytest.mark.skipif(
     os.name == "nt",
     reason="the GitHub Release assembly step runs under bash on ubuntu-latest",
@@ -29,17 +31,38 @@ VERSION = "1.2.3"
 ARTIFACT_NAME = f"KiroCrew-notarized-{CHANNEL}-{VERSION}"
 
 
-def _assembly_script() -> str:
+def _resolve(text: str) -> str:
+    resolved = text.replace("${{ needs.version.outputs.channel }}", CHANNEL)
+    resolved = resolved.replace("${{ needs.version.outputs.version }}", VERSION)
+    assert "${{" not in resolved, "test harness left an unresolved GitHub expression"
+    return resolved
+
+
+def _assembly_step() -> dict:
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     steps = workflow["jobs"]["github-release"]["steps"]
     step = next((item for item in steps if item.get("name") == STEP_NAME), None)
     assert step is not None, f"release workflow step {STEP_NAME!r} not found"
+    return step
 
-    script = step["run"]
-    script = script.replace("${{ needs.version.outputs.channel }}", CHANNEL)
-    script = script.replace("${{ needs.version.outputs.version }}", VERSION)
-    assert "${{" not in script, "test harness left an unresolved GitHub expression"
-    return script
+
+def _assembly_script() -> str:
+    return _resolve(_assembly_step()["run"])
+
+
+def _assembly_env() -> dict[str, str]:
+    """The step's own ``env:`` block, which Actions exports before the script runs.
+
+    Read from the workflow rather than hardcoded here: the script runs under
+    ``set -u``, so a value the step declares and this harness omits does not
+    quietly default -- every test in this file dies with ``unbound variable``
+    instead of exercising the fail-closed paths it exists to pin. Reading the
+    block keeps the harness faithful to what the runner actually provides, and
+    still fails loudly if the step starts reading a variable nobody sets.
+    """
+    return {
+        name: _resolve(str(value)) for name, value in (_assembly_step().get("env") or {}).items()
+    }
 
 
 def _artifact_dir(root: Path, name: str = ARTIFACT_NAME) -> Path:
@@ -71,8 +94,9 @@ def _run_assembly(root: Path) -> subprocess.CompletedProcess[str]:
         ["bash", "-c", _assembly_script()],
         cwd=root,
         capture_output=True,
-        text=True,
         check=False,
+        env={**os.environ, **_assembly_env()},
+        **UTF8_TEXT,
     )
 
 
@@ -130,6 +154,30 @@ def test_non_udif_dmg_fails(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "is not a valid UDIF DMG" in result.stderr + result.stdout
+
+
+def test_symbols_manifest_is_required_on_the_channel_that_builds(tmp_path: Path) -> None:
+    """Insider builds the desktop legs, so a missing Electron pin is a lost artifact.
+
+    The other direction is pinned by the passing stable cases above, which carry no
+    manifest at all: ``build-desktop`` is ``if: channel == 'insider'``, so demanding
+    one on stable would fail this job on every stable tag and publish no Release
+    page -- the incident release.yml's own comment records. Executed rather than
+    grepped because only running the script proves which channel each branch takes.
+    """
+    _write_valid_handoff(tmp_path)
+
+    result = subprocess.run(
+        ["bash", "-c", _assembly_script()],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        env={**os.environ, **_assembly_env(), "CHANNEL": "insider"},
+        **UTF8_TEXT,
+    )
+
+    assert result.returncode != 0
+    assert "No symbols-manifest.json found" in result.stderr + result.stdout
 
 
 def test_exact_gated_handoff_is_renamed_for_the_release(tmp_path: Path) -> None:

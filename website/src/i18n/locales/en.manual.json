@@ -1336,6 +1336,12 @@
       "upload_note": "PNG, JPEG, or WEBP. Cropped square and scaled to 512 px before it is stored.",
       "upload_too_large": "That file is too large (20 MB max)."
     },
+    "crashNotice": {
+      "diagnostics_were_saved_locally": "New crash records saved on this machine: {{n}}. Attach them when you report the problem.",
+      "dismiss": "Dismiss",
+      "show_diagnostics": "Show diagnostics",
+      "the_app_closed_unexpectedly": "The app closed unexpectedly"
+    },
     "crewWakeSection": {
       "active": "active",
       "pause_named": "Pause {{name}}",
