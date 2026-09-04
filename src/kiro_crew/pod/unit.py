@@ -32,7 +32,7 @@ from pathlib import Path
 from kiro_crew import pinned_fs
 from kiro_crew.atomic_write import atomic_write_at
 from kiro_crew.pod import provision as prov
-from kiro_crew.pod.config import PodConfig, environment_vars
+from kiro_crew.pod.config import TERMINAL_BOOT_EXIT_CODES, PodConfig, environment_vars
 from kiro_crew.service.common import systemd_quote
 
 _UNIT_TEMPLATE = """\
@@ -59,6 +59,13 @@ ExecStart={kirocrew_bin} pod _run %i
 # Self-heal a crash, but don't fight a deliberate stop.
 Restart=on-failure
 RestartSec=5
+# ...and don't fight a REFUSAL either. Every FATAL in kiro_crew.pod.runtime.boot is
+# a standing condition (no pinned checkout / venv / built dist, the derived port is
+# the live plane, or a pod OS-home component that could not be link-checked), so
+# restarting re-runs the identical refusal every 5s and buries the reason under
+# repeats. These exits make the unit go `failed` and STAY there with the FATAL
+# line visible. Values come from kiro_crew.pod.config.TERMINAL_BOOT_EXIT_CODES.
+RestartPreventExitStatus={terminal_exit_codes}
 
 # Resource isolation: cap so a runaway pod can't starve the live plane.
 MemoryMax=4G
@@ -109,6 +116,7 @@ def render_unit(cfg: PodConfig) -> str:
         kirocrew_bin=" ".join(systemd_quote(arg) for arg in _kirocrew_argv()),
         unit_prefix=cfg.unit_prefix,
         environment=_environment_block(cfg),
+        terminal_exit_codes=" ".join(str(code) for code in TERMINAL_BOOT_EXIT_CODES),
     )
 
 
@@ -310,15 +318,31 @@ def unit_exec_ok(cfg: PodConfig) -> bool:
 # tuple: ``unit_is_current`` hands it straight to ``str.startswith``.
 _REMOVED_DIRECTIVES: tuple[str, ...] = ("ExecStopPost=",)
 
+# The mirror of the above, for directives an older unit LACKS. ``_REMOVED_``
+# catches an upgrade that must drop something; this catches one that must gain
+# something, which the removal check alone silently missed.
+#
+# ``RestartPreventExitStatus`` is what makes a fail-closed boot refusal actually
+# terminal instead of a 5s restart loop (see
+# ``pod/config.TERMINAL_BOOT_EXIT_CODES``). It was ADDED, so on every machine that
+# already had a pod unit the removal-only test reported "current", the refresh was
+# skipped, and the directive would never have landed -- the refusal would still
+# loop. Found in live pod acceptance, not by the unit tests: a rendered-template
+# assertion passes while the INSTALLED unit is what systemd executes.
+#
+# Prefix-matched like the removed set, so a value change does not need a new entry.
+_REQUIRED_DIRECTIVES: tuple[str, ...] = ("RestartPreventExitStatus=",)
+
 
 def unit_is_current(cfg: PodConfig) -> bool:
     """True when the installed unit is one this build is willing to boot.
 
-    Two ways it can be stale, and a start self-heals both by re-rendering: the
-    baked ExecStart binary no longer exists (:func:`unit_exec_ok`), or the unit
-    still carries a directive this build has removed. The second matters on
-    UPGRADE — the unit is written once by ``pod install``, so without this check a
-    machine that installed an older Kiro Crew would keep the teardown hook, and
+    Three ways it can be stale, and a start self-heals all of them by
+    re-rendering: the baked ExecStart binary no longer exists
+    (:func:`unit_exec_ok`), the unit still carries a directive this build has
+    REMOVED, or it is missing one this build now REQUIRES. All three matter on
+    UPGRADE — the unit is written once by ``pod install``, so without these checks
+    a machine that installed an older Kiro Crew would keep the old definition, and
     keep the defect, until someone happened to reinstall by hand.
     """
     if not unit_exec_ok(cfg):
@@ -329,4 +353,9 @@ def unit_is_current(cfg: PodConfig) -> bool:
         return False
     # str.startswith takes the whole tuple, so one pass answers for every removed
     # directive.
-    return not any(line.startswith(_REMOVED_DIRECTIVES) for line in text.splitlines())
+    lines = text.splitlines()
+    if any(line.startswith(_REMOVED_DIRECTIVES) for line in lines):
+        return False
+    return all(
+        any(line.startswith(required) for line in lines) for required in _REQUIRED_DIRECTIVES
+    )

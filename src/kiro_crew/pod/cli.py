@@ -904,7 +904,22 @@ def _run_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
     # Audit BEFORE boot — boot() exec()s the gateway and never returns on success.
     _audit("pod.boot", "allowed", f"name={args.name}")
     rc = rt.boot(cfg, args.name)
+    # Audit the HONEST code, before any service-manager translation below.
     _audit("pod.boot", "failure", f"name={args.name}", error=f"exit={rc}")
+    if rt.IS_MACOS:
+        # launchd has no RestartPreventExitStatus: its only restart discriminator
+        # is the success/failure axis, and this backend's KeepAlive restarts on
+        # NON-ZERO. A terminal refusal must therefore exit 0 or launchd re-runs it
+        # every 5s forever. See launchd.launchd_exit_code for the man-page text and
+        # for why crash recovery survives; PodConfig.refusal_file is what keeps the
+        # refusal legible once its exit status stops saying so.
+        exit_code = rt.launchd.launchd_exit_code(rc)
+        if exit_code != rc:
+            print(
+                f"kirocrew-pod: exiting 0 instead of {rc} so launchd does not restart "
+                f"into the same refusal every 5s; recorded at {cfg.refusal_file(args.name)}"
+            )
+        sys.exit(exit_code)
     sys.exit(rc)
 
 
