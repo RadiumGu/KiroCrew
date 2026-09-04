@@ -56,6 +56,17 @@ from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
 
+#: ``on_app_disable`` outcome keys whose ``failed:``-marked value means residual
+#: third-party EXECUTION rather than data left unwritten, mapped to the label used
+#: when reporting it. Membership is what makes a key a failure candidate at all: a
+#: key absent from here is neither failed nor warned, which is how a stubborn job
+#: worker ("N worker(s) still running") once read as a clean teardown.
+_RESIDUAL_EXECUTION_KEYS = {
+    "cron_cleanup": "cron cleanup",
+    "startup_cleanup": "startup cleanup",
+    "job_cleanup": "job cleanup",
+}
+
 
 @dataclass
 class TeardownResult:
@@ -84,7 +95,11 @@ class TeardownResult:
 
 
 async def teardown_app_runtime(
-    name: str, record: dict[str, Any], *, withdrawing_trust: bool = False
+    name: str,
+    record: dict[str, Any],
+    *,
+    withdrawing_trust: bool = False,
+    bounded_startup: bool = False,
 ) -> TeardownResult:
     """Stop *name*'s running code.
 
@@ -123,8 +138,19 @@ async def teardown_app_runtime(
     # and refuses BEFORE any teardown mutation. Ordinary disable keeps its existing
     # unbounded wait contract. The proven result is passed into on_app_disable so
     # ownership cannot be checked a second time after teardown has begun.
+    #
+    # ``bounded_startup`` is a SEPARATE knob from ``withdrawing_trust`` on purpose,
+    # even though trust withdrawal implies it. A caller can need the bound without
+    # wanting withdrawal's other two effects -- withdrawal also ignores the app's
+    # ``resources`` contract and runs the app's OWN shutdown code unconditionally
+    # (``app_may_be_running`` below) -- so folding the two together would force a
+    # caller that merely cannot afford to block forever into launching third-party
+    # code. The background reconciliation sweep is exactly that caller: an
+    # unbounded wait there wedges the whole sweep on one stuck app and every later
+    # disabled app stays registered and served, while a bounded refusal is reported
+    # as a failure the caller retries.
     startup_stopped = await stop_app_startup_hooks(
-        name, bounded=withdrawing_trust
+        name, bounded=withdrawing_trust or bounded_startup
     )
     if not startup_stopped:
         return TeardownResult(
@@ -145,7 +171,7 @@ async def teardown_app_runtime(
     # call is first so the window is closed before it can open, and it runs before
     # ``disable_app`` writes the ``enabled`` flag, so a hook must not wait on that
     # flag to decide it has been switched off.
-    await notify_app_disabled(name)
+    workers_stood_down = await notify_app_disabled(name)
 
     # Every note is scrubbed HERE, as it is created, rather than by each caller.
     #
@@ -168,6 +194,16 @@ async def teardown_app_runtime(
 
     def _fail(msg: str) -> None:
         failures.append(redact(msg))
+
+    # Recorded HERE rather than at the call site, because `_fail` does not exist yet
+    # up there and the stand-down must stay the FIRST step. A hook still running is
+    # residual third-party execution, which is the postcondition this function
+    # exists to reach, so it is a failure the caller retries -- not a warning.
+    if not workers_stood_down:
+        _fail(
+            "app-disable hook did not return within its deadline; the app's workers "
+            "may still be running"
+        )
 
     # The app's OWN ``setup.onDisable`` script, FIRST — before the Python hooks and
     # before the backend process is stopped, because the script may need its own
@@ -293,10 +329,9 @@ async def teardown_app_runtime(
         # on and the operator had no way to learn state was dropped.
         if hooks_result:
             for key, value in hooks_result.items():
-                if key in {"cron_cleanup", "startup_cleanup"} and isinstance(value, str):
+                if key in _RESIDUAL_EXECUTION_KEYS and isinstance(value, str):
                     if value.startswith("failed:"):
-                        label = "cron cleanup" if key == "cron_cleanup" else "startup cleanup"
-                        _fail(f"{label} incomplete: {value}")
+                        _fail(f"{_RESIDUAL_EXECUTION_KEYS[key]} incomplete: {value}")
                     else:
                         _warn(value)
                 elif key == "hooks_shutdown" and value == "failed":
@@ -416,19 +451,66 @@ def unregister_app_disable_hook(app: str) -> None:
     _APP_DISABLE_HOOKS.pop(app, None)
 
 
-async def notify_app_disabled(app: str) -> None:
+#: How long the gateway waits for an app to stand its own workers down. An app hook
+#: that never returns must not be able to hold a teardown open: on the disable
+#: REQUEST that is a spinner the operator never gets out of, and in the background
+#: reconciliation sweep it parks the loop before deregistration, so a disabled app's
+#: routes stay callable indefinitely. Bounding it serves this function's existing
+#: contract -- "the teardown has to complete whether or not the app could stand its
+#: workers down" -- which a hang defeats exactly as much as an exception does.
+_DISABLE_HOOK_TIMEOUT_SEC = 30.0
+
+
+async def notify_app_disabled(app: str) -> bool:
     """Tell *app* its in-process workers must stop now.
 
-    Never raises: the teardown has to complete whether or not the app could stand
-    its workers down, for the same reason every other step here pushes through.
+    Never raises, and never waits without a deadline: the teardown has to complete
+    whether or not the app could stand its workers down, for the same reason every
+    other step here pushes through. A hang defeats that contract exactly as much as
+    an exception does, and on the disable REQUEST it is a spinner the operator never
+    escapes.
+
+    Returns whether the app is known to have finished standing down. A hook that
+    RAISED still counts: it returned control, so it is no longer executing.
+
+    A hook that overruns the deadline is NOT cancelled, and that is deliberate. The
+    hook is third-party code and may itself be awaiting ``asyncio.to_thread``;
+    cancelling the coroutine cancels the wrapper while the worker thread runs on, so
+    the await would return and make residual execution look terminal. That is the
+    same reason ``lifecycle.stop_detached_startup_hooks`` does not cancel either. The
+    task is left running and reported instead, so the caller can record the teardown
+    as unfinished rather than claiming a completion it cannot prove.
     """
     hook = _APP_DISABLE_HOOKS.get(app)
     if hook is None:
-        return
+        return True
+    task = asyncio.ensure_future(hook(app))
+    _done, pending = await asyncio.wait({task}, timeout=_DISABLE_HOOK_TIMEOUT_SEC)
+    if pending:
+        # Retrieve whatever it eventually produces, or asyncio logs an
+        # "exception was never retrieved" warning against a task nobody awaits.
+        task.add_done_callback(_swallow_late_hook_outcome)
+        logger.warning(
+            "app-disable hook for app %r has not returned within %.0fs; its workers "
+            "may still be running, and it is left to finish rather than cancelled",
+            app,
+            _DISABLE_HOOK_TIMEOUT_SEC,
+        )
+        return False
     try:
-        await hook(app)
+        task.result()
     except Exception:  # noqa: BLE001 - the teardown must complete regardless
         logger.warning("app-disable hook for app %r failed", app, exc_info=True)
+    return True
+
+
+def _swallow_late_hook_outcome(task: asyncio.Task[Any]) -> None:
+    """Mark a left-running disable hook's outcome retrieved once it finally ends."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("app-disable hook finished late with an error: %s", exc)
 
 
 #: Called with the dismissed slot's key. Registered per app name.
@@ -534,6 +616,22 @@ async def notify_slot_closed(app: str, slot_key: str) -> bool:
         )
         return False
     return True
+
+
+def apps_with_in_process_hooks() -> list[str]:
+    """Every app holding an entry in one of the three registries above.
+
+    A reconciliation sweep needs this because an app can be running work none of
+    the gateway's own tables know about: an ``on_startup`` hook that spawned its
+    own task and returned leaves nothing in ``_DETACHED_HOOK_TASKS``, no route, and
+    clean hook health. What it does leave -- if the app follows the contract
+    :func:`register_app_disable_hook` documents -- is the off-switch here, which
+    that docstring already names the app's own sweep as the backstop for "a disable
+    this process never saw". Enumerating the owners lets the GATEWAY'S sweep fire it
+    instead of waiting for the app's.
+    """
+    keys = set(_APP_DISABLE_HOOKS) | set(_SLOT_CLOSE_HOOKS) | set(_SLOT_CLOSE_UNDO_HOOKS)
+    return sorted(keys)
 
 
 def forget_app_hooks(app: str) -> None:

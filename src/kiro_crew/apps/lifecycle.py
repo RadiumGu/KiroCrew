@@ -70,6 +70,28 @@ def _mark_cancelled_startup_residual(app_name: str) -> None:
     )
 
 
+def apps_with_retained_startup_hooks() -> list[str]:
+    """Every app whose startup-hook execution this process is still tracking.
+
+    A startup hook that blew its readiness deadline is DETACHED, not abandoned:
+    the task keeps running with a live AppContext, and
+    :meth:`LifecycleDispatcher.stop_detached_startup_hooks` is what waits for it.
+    So this is the enumerable answer to "which apps have third-party code running
+    in here right now", which a reconciliation sweep needs in order to reach an app
+    whose only backend surface is ``on_startup``: such an app never enters the route
+    registry, so a sweep keyed on routes alone would never see its privileged work.
+
+    Residual markers are included. A cancelled hook's app is where cleanup most
+    needs another attempt, even though that attempt fails closed by design.
+
+    An EMPTY task set does not count. ``_observe_detached_hook_task`` pops an app's
+    entry once its last task is terminal, so an empty set is a transient state that
+    tracks no execution -- reporting it would name an app with nothing left to stop.
+    """
+    live = {name for name, tasks in _DETACHED_HOOK_TASKS.items() if tasks}
+    return sorted(live | _DETACHED_HOOK_RESIDUALS)
+
+
 def _observe_detached_hook_task(
     app_name: str,
     observation: dict[str, bool],

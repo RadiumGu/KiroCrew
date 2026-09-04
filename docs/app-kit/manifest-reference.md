@@ -434,6 +434,34 @@ version. Restart the Gateway, or disable and re-enable the app from the
 dashboard, for hook changes to take effect. The CLI prints this reminder after
 enabling any app that declares `backend.hooks`.
 
+**Teardown is not symmetric with that.** `kirocrew app disable` and `kirocrew app
+uninstall` are also out of process and also cannot reach a running Gateway's
+in-process state, but here the Gateway closes the gap itself: it re-reads
+`installed.json` every 15 seconds and, for any app that still has runtime state
+here while its metadata says not-enabled -- or the metadata is gone entirely --
+runs the same shared teardown sequence the dashboard's disable action uses
+(`teardown_app_runtime`): routes deregistered, modules unloaded, hook health
+cleared, backend process stopped, and (for the default `resources: "gateway"`)
+agents, skills and MCP servers deregistered. An `app`-resources app keeps its own
+registrations, exactly as it does on the dashboard's disable. So a CLI teardown
+does stop the app being served, within one sweep, with no restart.
+
+This is not limited to apps that declare `routes`. An app whose only backend
+surface is `on_startup` never enters the route registry, so the sweep also visits
+the owners of a retained startup task, a job-SDK registration, a failed hook
+wire-up, and an `on_disable` hook -- which is why registering one matters: if your
+`on_startup` spawns its own task and returns, that hook is the only thing the
+Gateway can call to stop it.
+
+Your app's own code is not started to do any of this. For a record that says
+not-enabled with no backend port observed, the sequence skips both
+`setup.onDisable` and the `on_shutdown` hook -- starting third-party code to
+finish a teardown the operator already performed would make the cleanup an
+execution vector. What it does still call is the in-process off-switch you
+register with `register_app_disable_hook`, because that STOPS work rather than
+starting it; that is the case its own documentation describes as "a disable this
+process never saw".
+
 **Importing your own modules.** Hook entry files are loaded from their file path
 into a synthetic package named after the app, never via `sys.path`, so use a
 **relative** import to reach a sibling module:
