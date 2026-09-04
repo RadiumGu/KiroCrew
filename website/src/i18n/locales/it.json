@@ -9361,7 +9361,12 @@
         "kind_internal_url": "un URL interno",
         "card_wordmark": "{{productName}}",
         "sensitive_in_card": "Prima di condividere — la card contiene: {{kinds}}",
-        "sensitive_in_caption": "Prima di condividere — il testo del post contiene: {{kinds}}"
+        "sensitive_in_caption": "Prima di condividere — il testo del post contiene: {{kinds}}",
+        "withdrawn_by_policy": "La condivisione è stata disattivata da una politica. Copia il tuo testo adesso se vuoi conservarlo — alla chiusura di questa finestra non viene salvato.",
+        "copy_text_only": "Copia testo",
+        "copied_text": "Copiato",
+        "copy_text_failed": "Copia non riuscita",
+        "copy_text_unavailable": "Appunti non disponibili qui: il testo del post è selezionato, copialo con la tastiera"
       }
     },
     "chatPage": {

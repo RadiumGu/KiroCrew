@@ -9095,7 +9095,12 @@
         "kind_internal_url": "内部链接",
         "card_wordmark": "{{productName}}",
         "sensitive_in_card": "分享前请注意——卡片中检测到：{{kinds}}",
-        "sensitive_in_caption": "分享前请注意——帖子文案中检测到：{{kinds}}"
+        "sensitive_in_caption": "分享前请注意——帖子文案中检测到：{{kinds}}",
+        "withdrawn_by_policy": "分享功能已被策略关闭。想保留文案就先复制——关闭此对话框后不会保存。",
+        "copy_text_only": "复制文案",
+        "copied_text": "已复制",
+        "copy_text_failed": "复制失败",
+        "copy_text_unavailable": "当前环境无法写入剪贴板——文案已选中，请用键盘复制"
       }
     },
     "chatPage": {

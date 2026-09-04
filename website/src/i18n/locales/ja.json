@@ -9095,7 +9095,12 @@
         "kind_internal_url": "内部 URL",
         "card_wordmark": "{{productName}}",
         "sensitive_in_card": "共有前にご確認ください — カードに次が含まれています：{{kinds}}",
-        "sensitive_in_caption": "共有前にご確認ください — 投稿テキストに次が含まれています：{{kinds}}"
+        "sensitive_in_caption": "共有前にご確認ください — 投稿テキストに次が含まれています：{{kinds}}",
+        "withdrawn_by_policy": "ポリシーにより共有が無効になりました。テキストを残したい場合は今コピーしてください — このダイアログを閉じると保存されません。",
+        "copy_text_only": "テキストをコピー",
+        "copied_text": "コピーしました",
+        "copy_text_failed": "コピーできませんでした",
+        "copy_text_unavailable": "この環境ではクリップボードを利用できません — 投稿テキストを選択済みなので、キーボードでコピーしてください"
       }
     },
     "chatPage": {

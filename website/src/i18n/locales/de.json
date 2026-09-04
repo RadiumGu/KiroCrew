@@ -9228,7 +9228,12 @@
         "kind_internal_url": "eine interne URL",
         "card_wordmark": "{{productName}}",
         "sensitive_in_card": "Vor dem Teilen — die Karte enthält: {{kinds}}",
-        "sensitive_in_caption": "Vor dem Teilen — der Beitragstext enthält: {{kinds}}"
+        "sensitive_in_caption": "Vor dem Teilen — der Beitragstext enthält: {{kinds}}",
+        "withdrawn_by_policy": "Das Teilen wurde per Richtlinie deaktiviert. Kopiere deinen Text jetzt, wenn du ihn behalten willst — beim Schließen dieses Dialogs wird er nicht gespeichert.",
+        "copy_text_only": "Text kopieren",
+        "copied_text": "Kopiert",
+        "copy_text_failed": "Kopieren fehlgeschlagen",
+        "copy_text_unavailable": "Zwischenablage hier nicht verfügbar — der Beitragstext ist markiert, kopiere ihn mit der Tastatur"
       }
     },
     "chatPage": {
