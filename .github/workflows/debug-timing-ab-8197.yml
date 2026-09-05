@@ -1,0 +1,31 @@
+name: Debug timing A/B (8197)
+
+on:
+  push:
+    branches: [debug/timing-ab-8197]
+
+jobs:
+  timing-ab:
+    name: Timing A/B on backend-test runner class
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          path: branch
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Interleaved A/B (10 rounds, alternating)
+        run: |
+          python branch/.github/debug-timing-ab-8197.py main/src branch/src
