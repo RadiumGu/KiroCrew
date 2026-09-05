@@ -879,6 +879,9 @@ export interface ChatSlot {
    * task-runner slot, or an app/cron-minted session (which can share the
    * `chat-<n>-<ts>` key shape) never triggers it. */
   origin?: string
+  /** A crew member slot with an unanswered escalation (a decision the member
+   *  is waiting on). Drives the roster's "Needs you" badge. */
+  needs_you?: boolean
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */
