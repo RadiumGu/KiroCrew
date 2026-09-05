@@ -24,6 +24,7 @@ import logging
 from aiohttp import web
 
 import kiro_crew.dashboard.handlers as _h
+from kiro_crew import crew_conversation
 from kiro_crew import members as members_mod
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
@@ -209,7 +210,55 @@ async def api_members(request: web.Request) -> web.Response:
         row["last_active_ts"] = mt
         row["last_message"] = preview
 
+    # Pending escalations, derived from each member's conversation index —
+    # one thread hop for the roster, same shape as the binding reads. The
+    # index is UI state (not the trust binding), so an unreadable file reads
+    # as "nothing pending" rather than failing the roster. The same hop primes
+    # the in-memory view the slots projection reads on the event loop, so a
+    # member whose escalations predate this gateway process gets its badge on
+    # the first roster load rather than on its next write.
+    def _read_escalations() -> dict[str, int]:
+        out: dict[str, int] = {}
+        for row in rows:
+            try:
+                crew_conversation.prime(row["slug"])
+                record = crew_conversation.read_conversation(row["slug"])
+                out[row["slug"]] = len(crew_conversation.pending_escalations(record))
+            except Exception:  # noqa: BLE001 - derived state never fails the roster
+                out[row["slug"]] = 0
+        return out
+
+    pending = await asyncio.to_thread(_read_escalations)
+    for row in rows:
+        count = pending.get(row["slug"], 0) if row["slot_key"] else 0
+        row["pending_escalations"] = count
+        row["needs_you"] = count > 0
+
     return web.json_response({"members": rows})
+
+
+async def api_member_conversation(request: web.Request) -> web.Response:
+    """GET /api/members/{slug}/conversation — the member's thin conversation index.
+
+    Pointers and escalation lifecycle only; bodies live in the referenced
+    session transcripts. ``needs_you`` and ``pending_escalations`` are derived
+    on read (a passed deadline reads as ``defaulted``/``expired`` without a
+    write). Owner-only, like the thread endpoint: the index names sessions.
+    """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = _deny_app_caller(request, "members.conversation")
+    if denied is not None:
+        return denied
+    refused = await require_owner_dashboard_request(request, "members.conversation")
+    if refused is not None:
+        return refused
+    try:
+        slug = members_mod.validate_slug(request.match_info.get("slug", ""))
+    except members_mod.MemberSlugError:
+        return web.json_response({"error": "invalid_slug"}, status=400)
+    record = await asyncio.to_thread(crew_conversation.read_conversation, slug)
+    return web.json_response(crew_conversation.public_view(record))
 
 
 async def api_member_thread(request: web.Request) -> web.Response:

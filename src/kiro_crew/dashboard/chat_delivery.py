@@ -231,6 +231,7 @@ async def steer_into_running_turn(
     message: str,
     *,
     send_id: str | None = None,
+    escalation_id: str | None = None,
 ) -> str:
     """Inject *message* into the slot's RUNNING turn; return a ``STEER_*`` outcome.
 
@@ -500,6 +501,10 @@ async def steer_into_running_turn(
         # transcript page is what mergePreservedThinking reads to resolve an
         # optimistic bubble by id (accepted steer vs raced new turn, #6075).
         meta["sendId"] = send_id
+    if escalation_id:
+        # Same reason as the queue path: a chip reply steered into a running
+        # member turn must still name the escalation record it answers.
+        meta["escalation_id"] = escalation_id
     # Store the sanitized form — raw content must never reach an external
     # surface — so the steer survives a page reload via the dirty-flush cycle.
     _row = slot.append("user", sanitized, "msg msg-u", ts=ts, meta=meta)
@@ -534,18 +539,27 @@ def queue_for_next_turn(
     message: str,
     *,
     directive_user_origin: bool = False,
+    escalation_id: str | None = None,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
 
     The running turn's teardown drains the queue, so this is how a message
     reaches a busy slot when steering is unavailable or not asked for.
+
+    ``escalation_id`` rides the queue entry's ``meta`` (the drain merges entry
+    meta onto the user row it appends) so an option-chip reply to a crew
+    member's escalation still names the record it answers when the member was
+    mid-turn — the common case, since a member that just escalated is working.
     """
     # circular import: session_control imports this module at module level.
     from kiro_crew.dashboard.session_control import containment_meta
 
+    meta = containment_meta(state, slot)
+    if escalation_id:
+        meta = {**meta, "escalation_id": escalation_id}
     qid = slot.queue_append(
         message,
-        meta=containment_meta(state, slot),
+        meta=meta,
         directive_user_origin=directive_user_origin,
     )
     state.broadcast_ws(

@@ -4922,6 +4922,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     # completion never merges (it drains alone and breaks any user-message
     # merge), so a merged row cannot carry them in the first place.
     _drained_ids: list[str] = []
+    _drained_escalation_ids: list[str] = []
     # circular import: session_control imports this package's modules at module level.
     from kiro_crew.dashboard.session_control import (
         QUEUED_CONTAINMENT_META_KEY,
@@ -4950,15 +4951,27 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
             _many = _item_meta.get("steer_delivery_ids")
             if isinstance(_many, list):
                 _drained_ids.extend(x for x in _many if isinstance(x, str) and x)
+            # Escalation replies accumulate for the same reason steer ids do:
+            # two option chips answered while the member was busy become ONE
+            # drained row, and last-wins merging would lose the first answer.
+            _esc = _item_meta.get("escalation_id")
+            if isinstance(_esc, str) and _esc and _esc not in _drained_escalation_ids:
+                _drained_escalation_ids.append(_esc)
             # The admission-time containment snapshot (#5911) is queue plumbing,
             # consumed by _drop_stale_admissions above; it says nothing about the
             # ROW, so it must not ride into the persisted transcript meta.
             _drained_meta.update(
-                (k, v) for k, v in _item_meta.items() if k != QUEUED_CONTAINMENT_META_KEY
+                (k, v)
+                for k, v in _item_meta.items()
+                if k not in (QUEUED_CONTAINMENT_META_KEY, "escalation_id")
             )
     if _drained_ids:
         _drained_meta.pop("steer_delivery_id", None)
         _drained_meta["steer_delivery_ids"] = _drained_ids
+    if len(_drained_escalation_ids) == 1:
+        _drained_meta["escalation_id"] = _drained_escalation_ids[0]
+    elif _drained_escalation_ids:
+        _drained_meta["escalation_ids"] = _drained_escalation_ids
     # Durable provenance for every `inject` row. `cls` is NOT persisted for this
     # role (chat_persistence only keeps it for `role == "system"`), and the
     # frontend's `meta.cronLabel` exists on the wire only because parse_cls_meta

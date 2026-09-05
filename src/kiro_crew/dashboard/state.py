@@ -2223,6 +2223,96 @@ def row_mid(row: Any) -> str | None:
     return mid if isinstance(mid, str) and mid else None
 
 
+#: Prefix ``session_control`` stamps on a peer-delivered user row. Spelled here
+#: rather than imported: session_control imports this module at module level.
+_PEER_SEND_PROVENANCE_PREFIX = "[sent by session "
+
+
+def _row_escalation_ids(meta: dict | None) -> list[str]:
+    """The escalation ids a user row names: ``escalation_id`` (one chip) or
+    ``escalation_ids`` (several chip replies drained as one row)."""
+    if not meta:
+        return []
+    out: list[str] = []
+    one = meta.get("escalation_id")
+    if isinstance(one, str) and one:
+        out.append(one)
+    many = meta.get("escalation_ids")
+    if isinstance(many, list):
+        out.extend(x for x in many if isinstance(x, str) and x and x not in out)
+    return out
+
+
+def _mark_member_escalations_answered(
+    slot_key: str, on_changed: object | None = None, *, escalation_ids: list[str] | None = None
+) -> None:
+    """Tell the conversation index that the human replied in *slot_key*.
+
+    The set of escalations pending at THIS moment is snapshotted here, on the
+    loop, from the index's in-memory view: the write runs on the executor a
+    beat later, and an escalation landing in between must not be counted by
+    the free-text rule (the transcript, which the chat projection reads, has
+    the reply before that card). Off the event loop when one is running (the
+    index may write a file), inline otherwise. When a record actually moved,
+    *on_changed* (the state's ``push_slots_update``) runs back on the loop so
+    the roster's ``needs_you`` clears with the reply instead of at the next
+    unrelated slots push. Never raises: the transcript row is already appended
+    and this is derived state.
+    """
+    from kiro_crew.members import DM_SLOT_KEY_PREFIX
+
+    if not slot_key.startswith(DM_SLOT_KEY_PREFIX):
+        return
+    slug = slot_key[len(DM_SLOT_KEY_PREFIX) :]
+
+    # circular import: crew_conversation imports members, which sits below this
+    # module in the layering (members -> artifacts -> validation).
+    from kiro_crew.crew_conversation import mark_answered, pending_ids
+
+    try:
+        candidates = pending_ids(slug)
+    except Exception:  # noqa: BLE001 - fall back to "whatever is pending at write time"
+        candidates = None
+    if candidates is not None and not candidates and not escalation_ids:
+        return  # nothing pending: an ordinary turn costs nothing here
+
+    def _do() -> int:
+        try:
+            return mark_answered(slug, escalation_ids=escalation_ids or None, candidates=candidates)
+        except Exception:  # noqa: BLE001 - derived state must never break an append
+            logger.debug("escalation answered-mark failed for %s", slug, exc_info=True)
+            return 0
+
+    def _notify() -> None:
+        if callable(on_changed):
+            try:
+                on_changed()
+            except Exception:  # noqa: BLE001 - sidebar refresh is best-effort
+                logger.debug("escalation answered: slots push failed", exc_info=True)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        if _do():
+            _notify()
+        return
+
+    def _run_then_notify() -> None:
+        if _do():
+            try:
+                loop.call_soon_threadsafe(_notify)
+            except RuntimeError:
+                # Loop closed between the append and the write (shutdown): the
+                # index is already updated; only the live refresh is lost, and
+                # the next slots push after restart reads the file.
+                logger.debug("escalation answered: loop closed before slots push")
+
+    try:
+        loop.run_in_executor(None, _run_then_notify)
+    except RuntimeError:
+        _do()
+
+
 def append_and_surface(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -3182,6 +3272,7 @@ class _ChatSlot:
         "_mcp_report_session_id",
         "_on_message",
         "_on_question_retired",
+        "_on_escalation_answered",
         "_has_reader_flag",
         "_stop_state_raw",
         "_stop_generation",
@@ -3492,6 +3583,7 @@ class _ChatSlot:
         # is invisible to a second window, and to a /pending response already in
         # flight — either would re-render a card whose answer has been sent.
         self._on_question_retired: object | None = None
+        self._on_escalation_answered: object | None = None  # Callable[[], None] | None
         self._has_reader_flag: bool = False  # True when HTTP SSE stream is draining
         self._stop_state_raw: str = "idle"  # 'idle' | 'soft_pending' | 'killing'
         # Monotonic count of stop INITIATIONS (idle → active edges of
@@ -4194,6 +4286,24 @@ class _ChatSlot:
                     self._on_question_retired(self.key, retired)  # type: ignore[operator]
                 except Exception:
                     pass
+        # A human reply in a crew member's DM thread answers the escalation(s)
+        # that member has pending: the conversation index (not the slot) owns
+        # that state, so hand it the fact and let it decide whether a write is
+        # even needed. Live appends only — a replayed row answers nothing — and
+        # only the HUMAN's rows: a peer session's ``session_send`` also lands as
+        # a ``user`` row, tagged with the provenance prefix, and a peer cannot
+        # answer the human's escalation on the human's behalf.
+        if (
+            role == "user"
+            and broadcast
+            and self.mode == "member"
+            and not content.startswith(_PEER_SEND_PROVENANCE_PREFIX)
+        ):
+            _mark_member_escalations_answered(
+                self.key,
+                self._on_escalation_answered,
+                escalation_ids=_row_escalation_ids(meta),
+            )
         msg: dict[str, Any] = {
             "role": role,
             "content": content,
@@ -6338,6 +6448,7 @@ class DashboardState:
         slot._tab_id = uuid.uuid4().hex[:12]
         slot._on_message = self._broadcast_chat_message
         slot._on_question_retired = self._broadcast_question_retired
+        slot._on_escalation_answered = self.push_slots_update
         slot._app = app
         # ``origin`` must be declared by the layer that actually knows it, and
         # an undeclared non-app slot stays UNTAGGED ("") rather than being

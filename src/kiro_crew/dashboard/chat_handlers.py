@@ -40,6 +40,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.dashboard import remote_mirror
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed
 from kiro_crew.dashboard.chat_auto_tag import maybe_auto_tag
+from kiro_crew.crew_conversation import ESCALATION_ID_RE as _ESCALATION_ID_RE
 from kiro_crew.dashboard.chat_delivery import (
     STEER_REQUEUED,
     STEER_STEERED,
@@ -217,6 +218,14 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     user_meta = body.get("meta")  # knowledge/files/pastes metadata from frontend
     if not isinstance(user_meta, dict):
         user_meta = None
+    # An option-chip reply to a crew member's escalation names the record it
+    # answers. Validated to the id grammar the index mints, so a client cannot
+    # smuggle arbitrary text into a queue entry's meta through this key; carried
+    # through the busy paths (steer / queue) because the drained user row is
+    # what the answer rule reads.
+    escalation_id = user_meta.get("escalation_id") if user_meta else None
+    if not (isinstance(escalation_id, str) and _ESCALATION_ID_RE.fullmatch(escalation_id)):
+        escalation_id = None
     theme_consent = body.get("theme_consent") is True
     # Content-bound persona consent: the sha256 hex the user
     # granted in the consent modal. Injection is gated on this matching the
@@ -568,6 +577,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 slot,
                 message,
                 send_id=user_meta.get("sendId") if user_meta else None,
+                escalation_id=escalation_id,
             )
             if outcome == STEER_STEERED:
                 return web.json_response({"ok": True, "steered": True})
@@ -623,6 +633,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             slot,
             message,
             directive_user_origin=not bool(request_app),
+            escalation_id=escalation_id,
         )
         return web.json_response({"ok": True, "queued": True, "queue_id": qid})
 
