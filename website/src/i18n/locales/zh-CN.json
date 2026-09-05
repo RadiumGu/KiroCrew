@@ -121,9 +121,7 @@
       "delivery_unconfirmed": "尚未确认送达——你的文字已放回输入框；再次发送前请先查看对话记录。",
       "delivery_unconfirmed_option": "尚未确认送达——请先查看对话记录，若未出现再重新选择该选项。",
       "message": "输入消息…",
-      "send": "发送",
       "send_failed_connection": "发送失败——请检查网络连接后重试。",
-      "send_message": "发送消息",
       "session_ready_type_a_message_to_start": "会话已就绪。输入消息即可开始。",
       "streaming": "流式输出中"
     },

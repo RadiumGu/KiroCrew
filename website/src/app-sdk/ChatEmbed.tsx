@@ -2,7 +2,9 @@
  * ChatEmbed — embeddable chat widget using KiroCrew's native rendering.
  *
  * Uses ChatMessageList (shared with ChatPage) for message rendering.
- * Manages its own state via useAppApi() + React Query. No Redux dependency.
+ * Transcript and send state live in useAppApi() + React Query; the composer
+ * subtree (ChatInput) reads slot state from Redux, so a host mounts this under
+ * the dashboard store as every in-tree app already does.
  *
  * State management: polling via useQuery refetchInterval.
  * Poll faster during streaming (1s), slower when idle (5s).
@@ -10,14 +12,29 @@
  * Sending goes through the chat-core transport (`sendTurn`) over the app-sdk
  * wire, so the receipt contract is the shared one and the host app's
  * `allowedApiPaths` grant for `/api/chat` still gates the POST.
+ *
+ * The composer is the REAL native ChatInput (the same one ChatPage, ChatPane
+ * and SideChat render), mounted inside a SlotProvider for the embedded slot and
+ * narrowed by OMISSION: no upload, voice, agent/model/project chrome, typed
+ * command menus, prompt optimizer or slot-approval chrome -- capabilities a
+ * host grants by passing the prop, so an embed that passes none renders none.
+ *
+ * ChatInput talks to the DASHBOARD client, not this embed's permission-scoped
+ * app wire. With the props above omitted, none of those calls fire: approval
+ * resolution is behind `slotApprovalChrome`, the auto-compact popover behind
+ * the context chip (`contextPct`), and the skills prefetch behind
+ * `typedCommandMenus`. Flipping any of them on for an embed re-opens the
+ * question of which API traffic the host app's manifest actually declares --
+ * ask it before granting the prop.
  */
 import { useRef, useState, useCallback, useEffect, useMemo, type ReactNode } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { ArrowUp, Loader2 } from 'lucide-react'
 import ChatMessageList from './ChatMessageList'
 import { useChatScrollFollow } from './useChatScrollFollow'
 import { JumpToBottomButton } from './ChatScrollChrome'
 import FollowUpBar from '../components/FollowUpBar'
+import ChatInput from '../components/ChatInput'
+import { SlotProvider } from '../providers/SlotContext'
 import { deriveFollowUpOptions } from './protocol'
 import { useComposerDraft } from './useComposerDraft'
 import { useAppApi } from './index'
@@ -159,7 +176,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
   /** The composer's draft behaviour, owned by the chat SDK rather than by this file —
    *  see useComposerDraft's own docs. Picking a follow-up option edits the draft
    *  (matching every other surface) instead of sending immediately. */
-  const { draft, setDraft, picked, toggleOption, composition, submitOnEnter } =
+  const { draft, setDraft, picked, toggleOption } =
     useComposerDraft({ followUpOptions })
 
   /** What the last send left behind on the transcript's tail, if anything:
@@ -221,16 +238,14 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
 
   /** Hand an undelivered message back to the composer. The user may have typed
    *  more since the send cleared it; `mergeRecoveredDraft` owns the rule for
-   *  keeping both, for every recovery site in the app. Its join is a paragraph
-   *  break, which suits every other composer -- but THIS one is a single-line
-   *  `<input>`, and a browser silently drops newlines assigned to an input's
-   *  value, gluing "first" and "second" into "firstsecond". So the break is
-   *  flattened to one space before it reaches the field. Returns the composer
+   *  keeping both, for every recovery site in the app -- its paragraph-break
+   *  join renders as such because the composer is ChatInput's textarea, the
+   *  same field every other recovery site writes into. Returns the composer
    *  value before and after, so an "unconfirmed" restore can be undone later
    *  if delivery is proven and the user has not touched it since. */
   const restoreIntoComposer = useCallback((text: string): { before: string; after: string } => {
     const before = draftRef.current
-    const after = mergeRecoveredDraft(before, text).replace(/\s*\n+\s*/g, ' ')
+    const after = mergeRecoveredDraft(before, text)
     setDraft(after)
     return { before, after }
   }, [setDraft])
@@ -439,27 +454,27 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
         </div>
       )}
 
-      <div className={`flex items-center gap-2 px-3 py-2 shrink-0 ${frameless ? '' : 'border-t border-border bg-bg-accent'}`}>
-        <input
-          type="text"
-          {...composition}
-          aria-label={i18nT('appSdk.chatEmbed.chat_message')}
-          className="flex-1 min-w-0 px-3 py-2 text-sm bg-bg-elevated border border-border rounded-md text-text outline-none focus-visible:border-accent transition-colors"
-          value={draft}
-          onChange={e => setDraft(e.target.value)}
-          onKeyDown={e => submitOnEnter(e, () => send())}
-          placeholder={running ? i18nT('appSdk.chatEmbed.agent_is_working') : (placeholder || i18nT('appSdk.chatEmbed.message'))}
-          disabled={sendMutation.isPending}
-        />
-        <button
-          className="p-2 rounded-md bg-accent text-accent-fg disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-80 transition-opacity"
-          onClick={() => send()}
-          disabled={sendMutation.isPending || !draft.trim()}
-          title={i18nT('appSdk.chatEmbed.send')}
-          aria-label={i18nT('appSdk.chatEmbed.send_message')}
-        >
-          {sendMutation.isPending ? <Loader2 size={16} className="animate-spin" /> : <ArrowUp size={16} />}
-        </button>
+      {/* The real composer, narrowed by omission (see the file header). No
+          onStop/onSteer: this embed must not stop or steer the slot's turn, so
+          while the agent runs the plain Send stays and a send simply queues
+          server-side (the same `queued` receipt as before the swap). Not
+          `disabled` while a send is in flight: `send()` already guards
+          re-entry, and ChatInput's placeholder chain would announce
+          "Stopping..." on every send. */}
+      <div className={`shrink-0 ${frameless ? '' : 'border-t border-border bg-bg-accent'}`}>
+        <SlotProvider slotId={slotKey}>
+          <ChatInput
+            value={draft}
+            onChange={setDraft}
+            onSend={() => send()}
+            isRunning={running}
+            placeholder={running ? i18nT('appSdk.chatEmbed.agent_is_working') : (placeholder || i18nT('appSdk.chatEmbed.message'))}
+            inputAriaLabel={i18nT('appSdk.chatEmbed.chat_message')}
+            typedCommandMenus={false}
+            slotApprovalChrome={false}
+            promptOptimizer={false}
+          />
+        </SlotProvider>
       </div>
     </div>
   )

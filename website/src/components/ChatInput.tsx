@@ -3468,7 +3468,10 @@ function ChatInput({
           {...ime.bindComposition<HTMLTextAreaElement>({
             // The paste-hover preview dismisses on blur; the guard's latch reset rides
             // in the binding itself, so these handlers only carry what is local here.
-            onFocus: prefetchSkills,
+            // The skills prefetch warms the $-picker; a host that turned the typed
+            // menus off has no picker to warm, and an app-embedded composer must not
+            // fire ambient /api/skills traffic its permission manifest never declared.
+            onFocus: typedCommandMenus ? prefetchSkills : undefined,
             onBlur: () => { if (hoverRef.current) hoverRef.current.handleMouseLeave() },
           })}
           onPaste={handlePaste}
